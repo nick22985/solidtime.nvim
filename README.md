@@ -9,3 +9,7 @@ A nvim plugin for [solidtime](https://www.solidtime.io/) to be able to start / s
 ## Requirements
 
 ## Getting Started
+
+
+Solidtime api docs:
+https://docs.solidtime.io/api-reference
