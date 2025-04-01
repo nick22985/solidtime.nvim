@@ -8,6 +8,7 @@ M.defaults = {
 	api_url = "https://app.solidtime.io/api/v1",
 	enable_logging = true, -- Enable logging (default: true)
 	debug_mode = false, -- Debug mode (default: false)
+	storage_dir = vim.fn.expand("~/.local/share/nvim/solidtime"),
 }
 
 -- Current configuration

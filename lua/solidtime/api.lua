@@ -114,7 +114,7 @@ function M.fetch_user_data(callback)
 	else
 		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 3600)
 		if err then
-			return nil, err
+			return { error = err }
 		else
 			return data
 		end

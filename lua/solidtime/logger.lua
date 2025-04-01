@@ -1,8 +1,5 @@
-local M = {}
-
--- FIXME: where should the path be?
-local log_file = vim.fn.expand("~/.solidtime.log")
 local config = require("solidtime.config")
+local M = {}
 
 M.levels = {
 	INFO = "INFO",
@@ -15,6 +12,7 @@ function M.log(level, message)
 	if not config.get().enable_logging then
 		return
 	end
+	local log_file = config.get().storage_dir .. "/.solidtime.log"
 
 	local log_entry = string.format("[%s] %s: %s", os.date("%Y-%m-%d %H:%M:%S"), level, message)
 

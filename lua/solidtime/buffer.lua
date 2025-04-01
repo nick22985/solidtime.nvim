@@ -159,18 +159,16 @@ function M.openUserCurrentTimeEntry()
 			return
 		end
 
-		api.createTimeEntry(getUserMemberships.data[1].organization.id, {
+		local timeEntry = api.createTimeEntry(getUserMemberships.data[1].organization.id, {
 			member_id = getUserMemberships.data[1].id,
 			description = "test",
 			billable = true,
 			start = format_iso8601(os.time()),
-		}, function(err, data)
-			P(err)
-			if err then
-				callback(err, nil)
-				return
-			end
-		end)
+		})
+		if timeEntry and not timeEntry.data then
+			callback(timeEntry.error, nil)
+			return
+		end
 
 		-- local currentTimeEntry = results[2]
 		-- if not currentTimeEntry.data then

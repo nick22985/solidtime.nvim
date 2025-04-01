@@ -2,6 +2,7 @@ local auth = require("solidtime.auth")
 local config = require("solidtime.config")
 local logger = require("solidtime.logger")
 local buffer = require("solidtime.buffer")
+local tracker = require("solidtime.tracker")
 
 local M = {}
 
@@ -11,7 +12,10 @@ function M.setup(opts)
 	opts = opts or {}
 
 	config.setup(opts)
+
 	logger.debug("Setting up solidtime.nvim...")
+
+	tracker.init()
 
 	-- Registers default commands
 	M.RegisterCommands()
