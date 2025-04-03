@@ -19,7 +19,22 @@ function M.setup(opts)
 
 	-- Registers default commands
 	M.RegisterCommands()
+	M.setup_keymaps()
 	logger.debug("solidtime.nvim setup complete.")
+end
+
+function M.setup_keymaps()
+	-- Keymaps for solidtime.nvim
+	vim.keymap.set("n", "<leader>so", function()
+		buffer.openUserCurrentTimeEntry()
+	end, { desc = "Open SolidTime" })
+
+	vim.keymap.set("n", "<leader>ts", function()
+		tracker.start()
+	end, { desc = "Start SolidTime Timer" })
+	vim.keymap.set("n", "<leader>te", function()
+		tracker.stop()
+	end, { desc = "Stop SolidTime Timer" })
 end
 
 -- Register commands for solidtime.nvim
@@ -30,13 +45,32 @@ function M.RegisterCommands()
 
 		if subcmd == "auth" then
 			auth.prompt_api_key()
+		elseif subcmd == "start" then
+			tracker.start()
+		elseif subcmd == "stop" then
+			tracker.stop()
+		elseif subcmd == "reload" then
+			-- local oldConfig = config.get()
+			-- get all loaded modules from package.loaded starting with solidtime.*
+
+			local solidtime_modules = {}
+			for name, _ in pairs(package.loaded) do
+				if name:match("^solidtime*") then
+					table.insert(solidtime_modules, name)
+					package.loaded[name] = nil
+				end
+			end
+			-- print("Unloaded modules: " .. vim.inspect(solidtime_modules))
+
+			vim.cmd("Lazy reload solidtime.nvim")
+			-- print("Reloaded solidtime.nvim")
 		else
 			print("Unknown command. Usage: :SolidTime auth")
 		end
 	end, {
 		nargs = "?",
 		complete = function()
-			return { "auth" }
+			return { "auth", "reload", "start", "stop" }
 		end,
 	})
 end
@@ -44,16 +78,5 @@ end
 function M.open()
 	buffer.openUserCurrentTimeEntry()
 end
-
-vim.api.nvim_set_keymap("n", "<leader>so", ":lua require('solidtime').open()<CR>", { noremap = true, silent = true })
-
--- reload plugin with lazy reload
-vim.api.nvim_buf_set_keymap(
-	0,
-	"n",
-	"<leader>rf",
-	"<cmd>Lazy reload solidtime.nvim<CR>",
-	{ noremap = true, silent = true }
-)
 
 return M

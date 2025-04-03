@@ -12,17 +12,17 @@ local M = {}
 -- }
 
 ---@class TimeEntry
+---@field id string|nil ID of the time entry
+---@field member_id string|nil Member ID associated with the entry
 ---@field organization_id string|nil Organization ID associated with the entry
 ---@field project_id string|nil Project ID associated with the entry
 ---@field task_id string|nil Task ID associated with the entry
----@field description string Description of the time entry
----@field billable boolean Whether the entry is billable
+---@field description string|nil Description of the time entry
+---@field billable boolean|nil Whether the entry is billable
 ---@field start string|osdate ISO8601 formatted start time
 ---@field start_timestamp number Unix timestamp for start time
 ---@field end string|osdate|nil ISO8601 formatted end time
 ---@field end_timestamp number|nil Unix timestamp for end time
----@field duration number|nil Duration in seconds
----@field current_duration number|nil Current duration for active entries
 ---@field tracking_type "local"|"online" Whether entry is tracked locally or online
 
 ---@class StorageData
@@ -31,10 +31,12 @@ local M = {}
 ---@field current_infomation CurrentInfo |nil
 
 ---@class CurrentInfo
----@field organization_id string|nil ID of the organization
+---@field member_id string ID of the member
+---@field organization_id string ID of the organization
 ---@field project_id string|nil ID of the project
 ---@field task_id string|nil ID of the task
 ---@field billable boolean Whether the entry is billable
+---@field description string|nil Description of the time entry
 
 ---@type StorageData
 local storage = {
@@ -59,12 +61,12 @@ local storage_file = nil
 local function is_online()
 	local online = false
 	pcall(function()
-		local result = api.fetch_user_data()
+		local result = api.fetch_user_data(nil, { ttl = 0 })
 		if result and not result.error then
 			online = result and not result.error
 		end
 	end)
-	return online and config.get().use_solidtime
+	return online
 end
 
 -- Format timestamp to ISO8601
@@ -143,6 +145,136 @@ function M.init()
 			save_storage()
 		end
 	end, { ["repeat"] = -1 })
+end
+
+local testCurrentConfig = {
+	organization_id = "522bc964-e5be-48ed-a7ec-ffd1ae0a5ec6",
+	member_id = "87c29bbc-3578-412a-a424-e4dceaea0078",
+}
+
+function M.start()
+	local now = os.time()
+
+	-- TODO: What to do if the user already has a active entry running should we start a new one or kill it?
+	-- Probally kill it and start the new one if the ID does not match any acitve_entry
+	storage.current_infomation = testCurrentConfig
+	local current_infomation = storage.current_infomation
+	if not current_infomation then
+		logger.error("No current information found. Please set it before starting a time entry.")
+		vim.notify("No current information found. Please set it before starting a time entry.", vim.log.levels.ERROR)
+		return
+	end
+	local description = current_infomation.description or nil
+	local billable = current_infomation.billable or false
+	local organization_id = current_infomation.organization_id
+	local project_id = current_infomation.project_id
+	local member_id = current_infomation.member_id
+	local isOnline = is_online()
+	-- check if the entry is already running
+	if storage.active_entry then
+		if isOnline then
+			local isActive = api.getUserTimeEntry()
+			if isActive and isActive.data then
+				logger.error("You already have an active time entry. Please stop it before starting a new one.")
+				return
+			else
+				-- TODO: check if the entry is completed in the database via storage.active_entry.id
+			end
+		else
+			-- TODO: anything to do here or just return?
+			logger.error("You already have an active time entry. Please stop it before starting a new one.")
+			return
+		end
+	end
+
+	storage.active_entry = {
+		start = format_iso8601(now),
+		start_timestamp = now,
+		tracking_type = isOnline and "online" or "local",
+		organization_id = organization_id,
+		project_id = project_id,
+		member_id = member_id,
+		description = description,
+		billable = billable,
+	}
+
+	if isOnline then
+		local result = api.createTimeEntry(organization_id, {
+			start = storage.active_entry.start,
+			project_id = project_id,
+			description = description,
+			billable = billable,
+			member_id = current_infomation.member_id,
+		})
+		if result and result.error then
+			logger.error("Failed to start time entry: " .. result.error)
+			storage.active_entry = nil
+			return
+		end
+		if result == nil then
+			logger.error("Failed to start time entry no data")
+			storage.active_entry = nil
+			return
+		end
+
+		storage.active_entry.id = result.data.id
+		vim.notify(
+			"Started time entry: " .. (storage.active_entry.description or "No description"),
+			vim.log.levels.INFO
+		)
+		save_storage()
+	end
+end
+
+function M.stop()
+	local now = os.time()
+	-- TODO: check online always if there is a time entry running. If their is and there is a active_entry set the active entry to the start of the online entry
+	if storage.active_entry == nil then
+		vim.notify("No active time entry to stop.", vim.log.levels.ERROR)
+		return
+	end
+
+	storage.active_entry["end"] = format_iso8601(now)
+	storage.active_entry.end_timestamp = now
+
+	local isOnline = is_online()
+	if isOnline then
+		-- check if any values are nil
+		if not storage.active_entry.organization_id or not storage.active_entry.id then
+			logger.error("No active time entry to stop.")
+			return
+		end
+		local result = api.updateTimeEntry(storage.active_entry.organization_id, storage.active_entry.id, {
+			member_id = storage.active_entry.member_id,
+			project_id = storage.active_entry.project_id,
+			start = storage.active_entry.start,
+			["end"] = storage.active_entry["end"],
+			billable = storage.active_entry.billable,
+			description = storage.active_entry.description,
+		})
+		if result and result.error then
+			logger.error("Failed to stop time entry: " .. result.error)
+			return
+		end
+		if result == nil then
+			logger.error("Failed to stop time entry no data")
+			return
+		end
+	else
+		table.insert(storage.pending_sync, storage.active_entry)
+		logger.info("Stopped time entry: " .. (storage.active_entry.description or "No description"))
+	end
+
+	local message = string.format(
+		"%s Stopped time entry: %s",
+		isOnline and "Online" or "Offline",
+		storage.active_entry.description or "No description"
+	)
+
+	vim.notify(message, vim.log.levels.INFO)
+
+	storage.active_entry = nil
+	save_storage()
 end
 
 return M

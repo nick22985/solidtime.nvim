@@ -5,17 +5,27 @@ local cache = require("solidtime.cache")
 local logger = require("solidtime.logger")
 local M = {}
 
+-- API module for solidtime.nvim
+-- This module handles API requests to the SolidTime API
+-- It provides functions to fetch user data, create time entries, and manage organizations.
+-- It also includes caching functionality to reduce the number of API requests made.
+
+---@param endpoint string API endpoint to call
+---@param method string HTTP method to use (GET, POST, PATCH, DELETE)
+---@param params table|nil Query parameters to include in the request
+---@param data table|nil Data to include in the request body (for POST and PATCH requests)
+---@param callback function|nil Callback function to handle the response
+---@param ttl number|nil Time-to-live for caching the response (in seconds)
 function M.get_data(endpoint, method, params, data, callback, ttl)
 	local cache_key = endpoint .. (params and vim.fn.json_encode(params) or "")
 
 	logger.debug(string.format("Checking cache for key: %s", cache_key))
 
-	-- ttl is nil means no caching
-	if ttl ~= nil then
+	if ttl and ttl ~= 0 then
 		local cached_data = cache.get_cached_data(cache_key, ttl)
 		if cached_data then
+			-- check if cached data is expired
 			logger.debug(string.format("Cache hit for key: %s. Returning cached data.", cache_key))
-			print("Returning cached data for " .. endpoint)
 			cached_data = vim.json.decode(cached_data)
 			if callback then
 				callback(nil, cached_data)
@@ -55,6 +65,7 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 		logger.debug(string.format("URL with query params: %s", endpoint))
 	end
 
+	---@type string
 	local url = base_url .. endpoint
 
 	local headers = {
@@ -76,6 +87,10 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 	local response
 	if method == "POST" then
 		response = curl.post(url, options)
+	elseif method == "PATCH" then
+		response = curl.patch(url, options)
+	elseif method == "PUT" then
+		response = curl.put(url, options)
 	elseif method == "DELETE" then
 		response = curl.delete(url, options)
 	else
@@ -96,6 +111,7 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 			return vim.json.decode(response.body)
 		end
 	else
+		P(response)
 		local error_message = vim.json.decode(response.body).message
 		-- local error_message = "test"
 		logger.error(string.format("Error response: %d for URL: %s", response.status, url))
@@ -107,12 +123,13 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 	end
 end
 
-function M.fetch_user_data(callback)
+function M.fetch_user_data(callback, options)
 	local endpoint = "users/me"
+	local ttl = options and options.ttl or 0
 	if callback then
-		M.get_data(endpoint, "GET", nil, nil, callback, 3600)
+		M.get_data(endpoint, "GET", nil, nil, callback, ttl)
 	else
-		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 3600)
+		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, ttl)
 		if err then
 			return { error = err }
 		else
@@ -167,6 +184,35 @@ function M.createTimeEntry(organization_id, data, callback)
 		M.get_data(endpoint, "POST", nil, data, callback, nil)
 	else
 		local response, err = M.get_data(endpoint, "POST", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@class updateTimeEntryData
+---@field member_id string
+---@field project_id string|nil
+---@field task_id string|nil
+---@field start string|osdate
+---@field end string|osdate|nil
+---@field billable boolean
+---@field description string|nil max 500 chracters
+---@field tags table|nil
+
+---@param organization_id string
+---@param time_entry_id string
+---@param data updateTimeEntryData|nil
+---@param callback function|nil
+function M.updateTimeEntry(organization_id, time_entry_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/time-entries/" .. time_entry_id
+
+	if callback then
+		M.get_data(endpoint, "PUT", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "PUT", nil, data, nil, nil)
 		if err then
 			return { error = err }
 		else

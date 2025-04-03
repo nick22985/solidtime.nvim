@@ -146,7 +146,7 @@ function M.openUserCurrentTimeEntry()
 		local results = vim
 			.iter({
 				api.getUserMemberships(),
-				-- api.getUserTimeEntry(),
+				api.getUserTimeEntry(),
 			})
 			-- :map(function(proc)
 			-- 	return proc
@@ -159,41 +159,41 @@ function M.openUserCurrentTimeEntry()
 			return
 		end
 
-		local timeEntry = api.createTimeEntry(getUserMemberships.data[1].organization.id, {
-			member_id = getUserMemberships.data[1].id,
-			description = "test",
-			billable = true,
-			start = format_iso8601(os.time()),
-		})
-		if timeEntry and not timeEntry.data then
-			callback(timeEntry.error, nil)
-			return
-		end
-
-		-- local currentTimeEntry = results[2]
-		-- if not currentTimeEntry.data then
-		-- 	callback(currentTimeEntry.error, nil)
+		-- local timeEntry = api.createTimeEntry(getUserMemberships.data[1].organization.id, {
+		-- 	member_id = getUserMemberships.data[1].id,
+		-- 	description = "test",
+		-- 	billable = true,
+		-- 	start = format_iso8601(os.time()),
+		-- })
+		-- if timeEntry and not timeEntry.data then
+		-- 	callback(timeEntry.error, nil)
 		-- 	return
 		-- end
-		-- currentTimeEntry = currentTimeEntry.data
 
-		-- local transformed_data = {}
-		-- local entry = currentTimeEntry
-		-- local entry_info = {
-		-- 	string.format("ID: %s", entry.id),
-		-- 	string.format("Organization: %s", entry.organization_id),
-		-- 	string.format("Project: %s", entry.project_id),
-		-- 	string.format("Billable: %s", entry.billable),
-		-- 	string.format("Description: %s", entry.description),
-		-- 	string.format("Start: %s", entry.start),
-		-- 	string.format("End: %s", entry["end"]),
-		-- }
-		--
-		-- for _, line in ipairs(entry_info) do
-		-- 	table.insert(transformed_data, line)
-		-- end
+		local currentTimeEntry = results[2]
+		if not currentTimeEntry.data then
+			callback(currentTimeEntry.error, nil)
+			return
+		end
+		currentTimeEntry = currentTimeEntry.data
 
-		callback(nil, { "test" })
+		local transformed_data = {}
+		local entry = currentTimeEntry
+		local entry_info = {
+			string.format("ID: %s", entry.id),
+			string.format("Organization: %s", entry.organization_id),
+			string.format("Project: %s", entry.project_id),
+			string.format("Billable: %s", entry.billable),
+			string.format("Description: %s", entry.description),
+			string.format("Start: %s", entry.start),
+			string.format("End: %s", entry["end"]),
+		}
+
+		for _, line in ipairs(entry_info) do
+			table.insert(transformed_data, line)
+		end
+
+		callback(nil, transformed_data)
 	end
 	fetch_and_display_data(getDataAndTransform)
 end
