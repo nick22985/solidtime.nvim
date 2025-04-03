@@ -23,8 +23,6 @@ jobs:
         run: |
           ${{ matrix.install-rg }}
 
-          rg --version
-
           git clone --depth 1 https://github.com/nvim-lua/plenary.nvim ../plenary.nvim
 
       - name: Run tests
