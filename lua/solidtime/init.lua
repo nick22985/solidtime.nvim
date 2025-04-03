@@ -7,7 +7,7 @@ local tracker = require("solidtime.tracker")
 local M = {}
 
 --- Setup function for solidtime.nvim
---- @param opts table Options for solidtime
+--- @param opts table|nil Options for solidtime
 function M.setup(opts)
 	opts = opts or {}
 
@@ -46,5 +46,14 @@ function M.open()
 end
 
 vim.api.nvim_set_keymap("n", "<leader>so", ":lua require('solidtime').open()<CR>", { noremap = true, silent = true })
+
+-- reload plugin with lazy reload
+vim.api.nvim_buf_set_keymap(
+	0,
+	"n",
+	"<leader>rf",
+	"<cmd>Lazy reload solidtime.nvim<CR>",
+	{ noremap = true, silent = true }
+)
 
 return M

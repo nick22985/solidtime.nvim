@@ -116,9 +116,6 @@ function M.init()
 		logger.error("Storage directory not set. Please configure it in your solidtime setup.")
 		return
 	end
-	config.defaults.use_solidtime = true
-	config.defaults.always_track_locally = false
-	config.defaults.sync_threshold = 1
 
 	ensure_storage_dir()
 	load_storage()
