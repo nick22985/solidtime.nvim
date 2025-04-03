@@ -21,7 +21,6 @@ jobs:
 
       - name: Prepare
         run: |
-          ${{ matrix.install-rg }}
 
           git clone --depth 1 https://github.com/nvim-lua/plenary.nvim ../plenary.nvim
 
