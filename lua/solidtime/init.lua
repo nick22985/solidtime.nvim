@@ -12,6 +12,7 @@ function M.setup(opts)
 	opts = opts or {}
 
 	config.setup(opts)
+	logger.init()
 
 	logger.debug("Setting up solidtime.nvim...")
 
@@ -35,6 +36,9 @@ function M.setup_keymaps()
 	vim.keymap.set("n", "<leader>te", function()
 		tracker.stop()
 	end, { desc = "Stop SolidTime Timer" })
+	vim.keymap.set("n", "<leader>tr", function()
+		M.reload()
+	end, { desc = "Reload SolidTime Timer" })
 end
 
 -- Register commands for solidtime.nvim
@@ -50,20 +54,7 @@ function M.RegisterCommands()
 		elseif subcmd == "stop" then
 			tracker.stop()
 		elseif subcmd == "reload" then
-			-- local oldConfig = config.get()
-			-- get all loaded modules from package.loaded starting with solidtime.*
-
-			local solidtime_modules = {}
-			for name, _ in pairs(package.loaded) do
-				if name:match("^solidtime*") then
-					table.insert(solidtime_modules, name)
-					package.loaded[name] = nil
-				end
-			end
-			-- print("Unloaded modules: " .. vim.inspect(solidtime_modules))
-
-			vim.cmd("Lazy reload solidtime.nvim")
-			-- print("Reloaded solidtime.nvim")
+			M.reload()
 		else
 			print("Unknown command. Usage: :SolidTime auth")
 		end
@@ -75,6 +66,25 @@ function M.RegisterCommands()
 	})
 end
 
+function M.reload()
+	-- local oldConfig = config.get()
+	-- get all loaded modules from package.loaded starting with solidtime.*
+
+	-- stop timers and save data
+	tracker.stop_tracking()
+
+	local solidtime_modules = {}
+	for name, _ in pairs(package.loaded) do
+		if name:match("^solidtime*") then
+			table.insert(solidtime_modules, name)
+			package.loaded[name] = nil
+		end
+	end
+	-- print("Unloaded modules: " .. vim.inspect(solidtime_modules))
+
+	vim.cmd("Lazy reload solidtime.nvim")
+	-- print("Reloaded solidtime.nvim")
+end
 function M.open()
 	buffer.openUserCurrentTimeEntry()
 end

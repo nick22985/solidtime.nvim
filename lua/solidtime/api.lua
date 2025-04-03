@@ -42,7 +42,6 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 
 	if not api_key then
 		logger.error("API key is not set.")
-		print("API key is not set.")
 		if callback then
 			callback("API key is not set.", nil)
 		else
@@ -111,10 +110,18 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 			return vim.json.decode(response.body)
 		end
 	else
-		P(response)
-		local error_message = vim.json.decode(response.body).message
-		-- local error_message = "test"
-		logger.error(string.format("Error response: %d for URL: %s", response.status, url))
+		local error_message = response.body
+		if response.body then
+			error_message = vim.json.decode(response.body).message
+		else
+			if response.body:find("Not Found") then
+				error_message = "Not Found"
+			else
+				error_message = "Error decoding JSON response"
+				logger.error(vim.inspect(response), false)
+			end
+		end
+		logger.error(string.format("Error response: %d for URL: %s", response.status, url), false)
 		if callback then
 			callback("API Error: " .. response.status .. " " .. error_message, nil)
 		else
@@ -171,7 +178,7 @@ function M.createTimeEntry(organization_id, data, callback)
 
 	if not data.member_id or not data.start then
 		local error_msg = "Missing required fields: member_id and start"
-		logger.error(error_msg)
+		logger.error(error_msg, false)
 		if callback then
 			callback(error_msg, nil)
 		else

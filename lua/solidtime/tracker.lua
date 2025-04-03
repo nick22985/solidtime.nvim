@@ -45,6 +45,8 @@ local storage = {
 	pending_sync = {},
 }
 
+local timer = nil
+
 ---@type string
 local storage_dir = nil
 
@@ -140,11 +142,22 @@ function M.init()
 	end
 
 	-- auto save every 60 seconds
-	vim.fn.timer_start(60000, function()
+	timer = vim.fn.timer_start(60000, function()
 		if storage.active_entry then
 			save_storage()
 		end
 	end, { ["repeat"] = -1 })
+end
+
+function M.stop_tracking()
+	if timer then
+		vim.fn.timer_stop(timer)
+		timer = nil
+	end
+	if storage.active_entry then
+		storage.active_entry = nil
+		save_storage()
+	end
 end
 
 local testCurrentConfig = {
@@ -155,13 +168,19 @@ local testCurrentConfig = {
 function M.start()
 	local now = os.time()
 
-	-- TODO: What to do if the user already has a active entry running should we start a new one or kill it?
-	-- Probally kill it and start the new one if the ID does not match any acitve_entry
+	-- FIXME: use online config here somehow
 	storage.current_infomation = testCurrentConfig
 	local current_infomation = storage.current_infomation
 	if not current_infomation then
 		logger.error("No current information found. Please set it before starting a time entry.")
 		vim.notify("No current information found. Please set it before starting a time entry.", vim.log.levels.ERROR)
+		-- search online to see if there is a active entry
+		local result = api.getUserTimeEntry()
+		if result and result.error then
+			logger.error("Failed to get user time entry: " .. result.error)
+			return
+		end
+
 		return
 	end
 	local description = current_infomation.description or nil
@@ -170,18 +189,22 @@ function M.start()
 	local project_id = current_infomation.project_id
 	local member_id = current_infomation.member_id
 	local isOnline = is_online()
-	-- check if the entry is already running
-	if storage.active_entry then
-		if isOnline then
-			local isActive = api.getUserTimeEntry()
-			if isActive and isActive.data then
-				logger.error("You already have an active time entry. Please stop it before starting a new one.")
+	if isOnline then
+		local result = api.getUserTimeEntry()
+		if result and result.data then
+			if storage.active_entry and storage.active_entry.id == result.data.id then
+				logger.error("You already have an active time entry")
 				return
 			else
-				-- TODO: check if the entry is completed in the database via storage.active_entry.id
+				storage.active_entry = result.data
+				storage.active_entry.tracking_type = "online"
+
+				logger.info("You already have an active time entry running online. Setting as active time entry")
+				return
 			end
-		else
-			-- TODO: anything to do here or just return?
+		end
+	else
+		if storage.active_entry then
 			logger.error("You already have an active time entry. Please stop it before starting a new one.")
 			return
 		end
@@ -228,10 +251,16 @@ end
 
 function M.stop()
 	local now = os.time()
-	-- TODO: check online always if there is a time entry running. If their is and there is a active_entry set the active entry to the start of the online entry
 	if storage.active_entry == nil then
-		vim.notify("No active time entry to stop.", vim.log.levels.ERROR)
-		return
+		local result = api.getUserTimeEntry()
+
+		if result and result.data then
+			storage.active_entry = result.data
+			storage.active_entry.tracking_type = "online"
+		else
+			vim.notify("No active time entry to stop.", vim.log.levels.ERROR)
+			return
+		end
 	end
 
 	storage.active_entry["end"] = format_iso8601(now)
@@ -254,6 +283,7 @@ function M.stop()
 		})
 		if result and result.error then
 			logger.error("Failed to stop time entry: " .. result.error)
+			storage.active_entry = nil
 			return
 		end
 		if result == nil then
@@ -268,7 +298,9 @@ function M.stop()
 	local message = string.format(
 		"%s Stopped time entry: %s",
 		isOnline and "Online" or "Offline",
-		storage.active_entry.description or "No description"
+		(storage.active_entry.description and storage.active_entry.description ~= "")
+				and storage.active_entry.description
+			or "No description"
 	)
 
 	vim.notify(message, vim.log.levels.INFO)
