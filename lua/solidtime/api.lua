@@ -118,10 +118,12 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 				error_message = "Not Found"
 			else
 				error_message = "Error decoding JSON response"
-				logger.error(vim.inspect(response), false)
 			end
 		end
-		logger.error(string.format("Error response: %d for URL: %s", response.status, url), false)
+		logger.error(
+			string.format("Error response: %d for URL: %s Response: %s", response.status, url, vim.inspect(response)),
+			false
+		)
 		if callback then
 			callback("API Error: " .. response.status .. " " .. error_message, nil)
 		else
@@ -145,15 +147,39 @@ function M.fetch_user_data(callback, options)
 	end
 end
 
+---@class apiError
+---@field error string Error message
+
+--- Represents a user's membership in an organization.
+--- @class UserMembership
+--- @field id string Membership ID
+--- @field organization table Organization information
+--- @field organization.id string Organization ID
+--- @field organization.name string Organization name
+--- @field organization.currency string Organization currency code
+--- @field role string User's role in organization (e.g., "owner")
+
+--- Represents the response containing user membership data.
+--- @class UserMembershipsResponse
+--- @field data UserMembership[] Array of user membership objects
+--- @field error string|nil Error message if request failed
+
+--- Retrieves the user's organization memberships.
+--- This function fetches the current user's organization memberships from the API.
+--- @param callback function|nil Optional callback function that receives the response data.
+---                              If provided, the request will be executed asynchronously.
+--- @return UserMembershipsResponse|apiError|nil apiResponse An table containing either membership data or error information
 function M.getUserMemberships(callback)
 	local endpoint = "users/me/memberships"
 	if callback then
 		M.get_data(endpoint, "GET", nil, nil, callback, 3600)
+		return nil
 	else
 		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 3600)
 		if err then
 			return { error = err }
 		else
+			---@type UserMembershipsResponse
 			return data
 		end
 	end
@@ -231,6 +257,20 @@ end
 -- Organization-related API calls
 function M.getOrganization(organization_id, callback)
 	local endpoint = "organizations/" .. organization_id
+	if callback then
+		M.get_data(endpoint, "GET", nil, nil, callback, 3600)
+	else
+		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 3600)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+function M.getOrganizationProjects(organization_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/projects"
 	if callback then
 		M.get_data(endpoint, "GET", nil, nil, callback, 3600)
 	else

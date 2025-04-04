@@ -27,7 +27,8 @@ end
 function M.setup_keymaps()
 	-- Keymaps for solidtime.nvim
 	vim.keymap.set("n", "<leader>so", function()
-		buffer.openUserCurrentTimeEntry()
+		-- buffer.openUserCurrentTimeEntry()
+		M.open()
 	end, { desc = "Open SolidTime" })
 
 	vim.keymap.set("n", "<leader>ts", function()
@@ -86,7 +87,7 @@ function M.reload()
 	-- print("Reloaded solidtime.nvim")
 end
 function M.open()
-	buffer.openUserCurrentTimeEntry()
+	buffer.selectActiveProject()
 end
 
 return M

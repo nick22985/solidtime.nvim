@@ -39,7 +39,7 @@ local M = {}
 ---@field description string|nil Description of the time entry
 
 ---@type StorageData
-local storage = {
+M.storage = {
 	current_infomation = nil,
 	active_entry = nil,
 	pending_sync = {},
@@ -59,6 +59,10 @@ end
 
 ---@type string
 local storage_file = nil
+
+function M.get_storage()
+	return M.storage
+end
 
 local function is_online()
 	local online = false
@@ -83,7 +87,7 @@ local function save_storage()
 	---@type file*|nil
 	local f = io.open(storage_file, "w")
 	if f then
-		f:write(vim.fn.json_encode(storage))
+		f:write(vim.fn.json_encode(M.storage))
 		f:close()
 		logger.debug("Local storage saved to " .. storage_file)
 	else
@@ -103,7 +107,7 @@ local function load_storage()
 			---@type StorageData|nil
 			local decoded = vim.fn.json_decode(content)
 			if decoded then
-				storage = decoded
+				M.storage = decoded
 				logger.debug("Local storage loaded from " .. storage_file)
 			end
 		end
@@ -124,11 +128,11 @@ function M.init()
 	ensure_storage_dir()
 	load_storage()
 
-	if storage.active_entry then
+	if M.storage.active_entry then
 		---@type number
 		local now = os.time()
 		---@type number
-		local start_time = storage.active_entry.start_timestamp
+		local start_time = M.storage.active_entry.start_timestamp
 		---@type number
 		local duration = now - start_time
 
@@ -137,13 +141,13 @@ function M.init()
 			logger.warn("Found a time entry running for more than 24 hours. Stopping it now.")
 			M.stop_tracking()
 		else
-			logger.info("Restored active time entry: " .. (storage.active_entry.description or "No description"))
+			logger.info("Restored active time entry: " .. (M.storage.active_entry.description or "No description"))
 		end
 	end
 
 	-- auto save every 60 seconds
 	timer = vim.fn.timer_start(60000, function()
-		if storage.active_entry then
+		if M.storage.active_entry then
 			save_storage()
 		end
 	end, { ["repeat"] = -1 })
@@ -154,23 +158,17 @@ function M.stop_tracking()
 		vim.fn.timer_stop(timer)
 		timer = nil
 	end
-	if storage.active_entry then
-		storage.active_entry = nil
+	if M.storage.active_entry then
+		M.storage.active_entry = nil
 		save_storage()
 	end
 end
 
-local testCurrentConfig = {
-	organization_id = "522bc964-e5be-48ed-a7ec-ffd1ae0a5ec6",
-	member_id = "87c29bbc-3578-412a-a424-e4dceaea0078",
-}
-
 function M.start()
 	local now = os.time()
 
-	-- FIXME: use online config here somehow
-	storage.current_infomation = testCurrentConfig
-	local current_infomation = storage.current_infomation
+	local current_infomation = M.storage.current_infomation
+
 	if not current_infomation then
 		logger.error("No current information found. Please set it before starting a time entry.")
 		vim.notify("No current information found. Please set it before starting a time entry.", vim.log.levels.ERROR)
@@ -192,25 +190,25 @@ function M.start()
 	if isOnline then
 		local result = api.getUserTimeEntry()
 		if result and result.data then
-			if storage.active_entry and storage.active_entry.id == result.data.id then
+			if M.storage.active_entry and M.storage.active_entry.id == result.data.id then
 				logger.error("You already have an active time entry")
 				return
 			else
-				storage.active_entry = result.data
-				storage.active_entry.tracking_type = "online"
+				M.storage.active_entry = result.data
+				M.storage.active_entry.tracking_type = "online"
 
 				logger.info("You already have an active time entry running online. Setting as active time entry")
 				return
 			end
 		end
 	else
-		if storage.active_entry then
+		if M.storage.active_entry then
 			logger.error("You already have an active time entry. Please stop it before starting a new one.")
 			return
 		end
 	end
 
-	storage.active_entry = {
+	M.storage.active_entry = {
 		start = format_iso8601(now),
 		start_timestamp = now,
 		tracking_type = isOnline and "online" or "local",
@@ -223,7 +221,7 @@ function M.start()
 
 	if isOnline then
 		local result = api.createTimeEntry(organization_id, {
-			start = storage.active_entry.start,
+			start = M.storage.active_entry.start,
 			project_id = project_id,
 			description = description,
 			billable = billable,
@@ -231,18 +229,18 @@ function M.start()
 		})
 		if result and result.error then
 			logger.error("Failed to start time entry: " .. result.error)
-			storage.active_entry = nil
+			M.storage.active_entry = nil
 			return
 		end
 		if result == nil then
 			logger.error("Failed to start time entry no data")
-			storage.active_entry = nil
+			M.storage.active_entry = nil
 			return
 		end
 
-		storage.active_entry.id = result.data.id
+		M.storage.active_entry.id = result.data.id
 		vim.notify(
-			"Started time entry: " .. (storage.active_entry.description or "No description"),
+			"Started time entry: " .. (M.storage.active_entry.description or "No description"),
 			vim.log.levels.INFO
 		)
 		save_storage()
@@ -251,39 +249,39 @@ end
 
 function M.stop()
 	local now = os.time()
-	if storage.active_entry == nil then
+	if M.storage.active_entry == nil then
 		local result = api.getUserTimeEntry()
 
 		if result and result.data then
-			storage.active_entry = result.data
-			storage.active_entry.tracking_type = "online"
+			M.storage.active_entry = result.data
+			M.storage.active_entry.tracking_type = "online"
 		else
 			vim.notify("No active time entry to stop.", vim.log.levels.ERROR)
 			return
 		end
 	end
 
-	storage.active_entry["end"] = format_iso8601(now)
-	storage.active_entry.end_timestamp = now
+	M.storage.active_entry["end"] = format_iso8601(now)
+	M.storage.active_entry.end_timestamp = now
 
 	local isOnline = is_online()
 	if isOnline then
 		-- check if any values are nil
-		if not storage.active_entry.organization_id or not storage.active_entry.id then
+		if not M.storage.active_entry.organization_id or not M.storage.active_entry.id then
 			logger.error("No active time entry to stop.")
 			return
 		end
-		local result = api.updateTimeEntry(storage.active_entry.organization_id, storage.active_entry.id, {
-			member_id = storage.active_entry.member_id,
-			project_id = storage.active_entry.project_id,
-			start = storage.active_entry.start,
-			["end"] = storage.active_entry["end"],
-			billable = storage.active_entry.billable,
-			description = storage.active_entry.description,
+		local result = api.updateTimeEntry(M.storage.active_entry.organization_id, M.storage.active_entry.id, {
+			member_id = M.storage.active_entry.member_id,
+			project_id = M.storage.active_entry.project_id,
+			start = M.storage.active_entry.start,
+			["end"] = M.storage.active_entry["end"],
+			billable = M.storage.active_entry.billable,
+			description = M.storage.active_entry.description,
 		})
 		if result and result.error then
 			logger.error("Failed to stop time entry: " .. result.error)
-			storage.active_entry = nil
+			M.storage.active_entry = nil
 			return
 		end
 		if result == nil then
@@ -291,21 +289,58 @@ function M.stop()
 			return
 		end
 	else
-		table.insert(storage.pending_sync, storage.active_entry)
-		logger.info("Stopped time entry: " .. (storage.active_entry.description or "No description"))
+		table.insert(M.storage.pending_sync, M.storage.active_entry)
+		logger.info("Stopped time entry: " .. (M.storage.active_entry.description or "No description"))
 	end
 
 	local message = string.format(
 		"%s Stopped time entry: %s",
 		isOnline and "Online" or "Offline",
-		(storage.active_entry.description and storage.active_entry.description ~= "")
-				and storage.active_entry.description
+		(M.storage.active_entry.description and M.storage.active_entry.description ~= "")
+				and M.storage.active_entry.description
 			or "No description"
 	)
 
 	vim.notify(message, vim.log.levels.INFO)
 
-	storage.active_entry = nil
+	M.storage.active_entry = nil
+	save_storage()
+end
+
+---@param organizationId string|nil Organization ID
+---@param memerId string|nil Member ID
+---@return nil
+M.selectActiveOrganization = function(organizationId, memerId)
+	if organizationId == nil then
+		logger.error("No organization id provided")
+		return
+	end
+	if memerId == nil then
+		logger.error("No member id provided")
+		return
+	end
+
+	M.storage.current_infomation.organization_id = organizationId
+	M.storage.current_infomation.member_id = memerId
+	M.storage.current_infomation.project_id = nil
+
+	save_storage()
+end
+
+M.selectActiveProject = function(projectId)
+	if projectId == nil then
+		logger.error("No project id provided")
+		return
+	end
+
+	if projectId == "clear" then
+		M.storage.current_infomation.project_id = nil
+		save_storage()
+		return
+	end
+
+	M.storage.current_infomation.project_id = projectId
+
 	save_storage()
 end
 
