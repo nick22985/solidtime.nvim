@@ -409,16 +409,22 @@ function M.start()
 			vim.log.levels.INFO
 		)
 		save_storage()
+		require("solidtime.autotrack").resume()
 	else
 		vim.notify(
 			"Started time entry (offline): " .. (M.storage.active_entry.description or "No description"),
 			vim.log.levels.INFO
 		)
 		save_storage()
+		require("solidtime.autotrack").resume()
 	end
 end
 
-function M.stop()
+function M.stop(opts)
+	opts = opts or {}
+	-- By default a manual stop pauses auto-tracking until the user starts again.
+	-- Internal callers (idle-stop) pass { pause_autotrack = false } to skip this.
+	local pause_autotrack = opts.pause_autotrack ~= false
 	local now = os.time()
 	if M.storage.active_entry == nil then
 		local result = api.getUserTimeEntry()
@@ -482,6 +488,11 @@ function M.stop()
 
 	M.storage.active_entry = nil
 	save_storage()
+
+	if pause_autotrack then
+		local autotrack = require("solidtime.autotrack")
+		autotrack.pause()
+	end
 end
 
 ---@param organizationId string|nil Organization ID

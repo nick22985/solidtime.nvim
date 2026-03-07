@@ -23,6 +23,18 @@ M.defaults = {
 		-- notification plugin (noice, nvim-notify, etc.) has time to load.
 		-- Set to 0 to notify immediately (may show the built-in blocking message).
 		startup_notify_delay = 100,
+
+		ignore_buftypes = { "nofile", "terminal", "help", "quickfix", "prompt" },
+
+		ignore_buf_patterns = {
+			"^neo%-tree ",
+			"^Neogit",
+			"^fugitive://",
+			"^gitsigns://",
+			"^diffview://",
+			"^Telescope",
+			"^toggleterm://",
+		},
 	},
 
 	-- Keymaps. Set any value to false to disable that mapping entirely.
@@ -59,7 +71,15 @@ function M.setup(user_config)
 	user_config = user_config or {}
 
 	local merged_keymaps = vim.tbl_extend("force", M.defaults.keymaps, user_config.keymaps or {})
-	local merged_autotrack = vim.tbl_extend("force", M.defaults.autotrack, user_config.autotrack or {})
+	local user_autotrack = user_config.autotrack or {}
+	local merged_autotrack = vim.tbl_extend("force", M.defaults.autotrack, user_autotrack)
+	-- List fields: user values *replace* defaults when provided; otherwise keep defaults.
+	if user_autotrack.ignore_buftypes ~= nil then
+		merged_autotrack.ignore_buftypes = user_autotrack.ignore_buftypes
+	end
+	if user_autotrack.ignore_buf_patterns ~= nil then
+		merged_autotrack.ignore_buf_patterns = user_autotrack.ignore_buf_patterns
+	end
 
 	M.options = vim.tbl_extend("force", M.defaults, user_config)
 	M.options.keymaps = merged_keymaps
