@@ -1,9 +1,3 @@
-local api = require("solidtime.api")
-
-local M = {}
-
--- function M.startTimerEntry()
--- 	--
--- end
-
-return M
+-- This file is intentionally empty.
+-- It is kept to avoid breaking any requires during development.
+return {}

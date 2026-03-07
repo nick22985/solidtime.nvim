@@ -5,11 +5,6 @@ local cache = require("solidtime.cache")
 local logger = require("solidtime.logger")
 local M = {}
 
--- API module for solidtime.nvim
--- This module handles API requests to the SolidTime API
--- It provides functions to fetch user data, create time entries, and manage organizations.
--- It also includes caching functionality to reduce the number of API requests made.
-
 ---@param endpoint string API endpoint to call
 ---@param method string HTTP method to use (GET, POST, PATCH, DELETE)
 ---@param params table|nil Query parameters to include in the request
@@ -24,15 +19,19 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 	if ttl and ttl ~= 0 then
 		local cached_data = cache.get_cached_data(cache_key, ttl)
 		if cached_data then
-			-- check if cached data is expired
 			logger.debug(string.format("Cache hit for key: %s. Returning cached data.", cache_key))
-			cached_data = vim.json.decode(cached_data)
-			if callback then
-				callback(nil, cached_data)
+			local ok, decoded = pcall(vim.json.decode, cached_data)
+			if not ok or decoded == nil then
+				logger.warn(string.format("Cache decode failed for key: %s — evicting.", cache_key))
+				cache.invalidate_cache(cache_key)
 			else
-				return cached_data
+				if callback then
+					callback(nil, decoded)
+				else
+					return decoded
+				end
+				return
 			end
-			return
 		end
 		logger.debug(string.format("Cache miss for key: %s. Making API request to endpoint: %s", cache_key, endpoint))
 	end
@@ -56,8 +55,21 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 
 	if params then
 		local query = ""
+		local function encode_val(v)
+			return tostring(v)
+				:gsub("([^%w%-%.%_%~ ])", function(c)
+					return string.format("%%%02X", string.byte(c))
+				end)
+				:gsub(" ", "+")
+		end
 		for key, value in pairs(params) do
-			query = query .. key .. "=" .. value .. "&"
+			if type(value) == "table" then
+				for _, item in ipairs(value) do
+					query = query .. key .. "[]=" .. encode_val(item) .. "&"
+				end
+			else
+				query = query .. key .. "=" .. encode_val(value) .. "&"
+			end
 		end
 		query = query:sub(1, -2)
 		endpoint = endpoint .. "?" .. query
@@ -97,27 +109,56 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 	end
 
 	logger.debug(string.format("Received response status: %d for URL: %s", response.status, url))
-	-- response.status = 401
 
 	if response.status == 200 or response.status == 201 then
+		local ok, decoded = pcall(vim.json.decode, response.body or "")
+		if not ok or decoded == nil then
+			local body = response.body or ""
+			local err
+			if body:match("^<!DOCTYPE") or body:match("^<html") then
+				err = "API key invalid or expired — run :SolidTime auth to re-authenticate"
+			else
+				err = "Invalid JSON response from " .. endpoint .. " (status=200)"
+			end
+			logger.error(err)
+			if callback then
+				callback(err, nil)
+			else
+				return nil, err
+			end
+			return
+		end
 		if ttl ~= nil then
 			cache.set_cached_data(cache_key, response.body, ttl)
 			logger.debug(string.format("Caching response for key: %s", cache_key))
 		end
 		if callback then
-			callback(nil, vim.json.decode(response.body))
+			callback(nil, decoded)
 		else
-			return vim.json.decode(response.body)
+			return decoded
+		end
+	elseif response.status == 204 then
+		if callback then
+			callback(nil, {})
+		else
+			return {}
+		end
+	elseif response.status == 401 then
+		local error_message = "Unauthorized — check your API key (`:SolidTime auth`)"
+		logger.error(error_message)
+		if callback then
+			callback("API Error: 401 " .. error_message, nil)
+		else
+			return nil, "API Error: 401 " .. error_message
 		end
 	else
-		local error_message = response.body
-		if response.body then
-			error_message = vim.json.decode(response.body).message
-		else
-			if response.body:find("Not Found") then
-				error_message = "Not Found"
+		local error_message = "Unknown error"
+		if response.body and response.body ~= "" then
+			local ok, decoded = pcall(vim.json.decode, response.body)
+			if ok and decoded and decoded.message then
+				error_message = decoded.message
 			else
-				error_message = "Error decoding JSON response"
+				error_message = response.body
 			end
 		end
 		logger.error(
@@ -254,7 +295,6 @@ function M.updateTimeEntry(organization_id, time_entry_id, data, callback)
 	end
 end
 
--- Organization-related API calls
 function M.getOrganization(organization_id, callback)
 	local endpoint = "organizations/" .. organization_id
 	if callback then
@@ -279,6 +319,284 @@ function M.getOrganizationProjects(organization_id, callback)
 			return { error = err }
 		else
 			return data
+		end
+	end
+end
+
+---@class createProjectData
+---@field name string
+---@field color string Hex color string (e.g. "#ff0000")
+---@field billable_by_default boolean
+---@field is_billable boolean
+---@field client_id string|nil
+
+---@param organization_id string
+---@param data createProjectData
+---@param callback function|nil
+function M.createProject(organization_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/projects"
+	if callback then
+		M.get_data(endpoint, "POST", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "POST", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@param organization_id string
+---@param project_id string
+---@param data table  { name, color, billable_by_default, is_billable, client_id }
+---@param callback function|nil
+function M.updateProject(organization_id, project_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/projects/" .. project_id
+	if callback then
+		M.get_data(endpoint, "PUT", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "PUT", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+--- Retrieves all tags for an organization.
+---@param organization_id string
+---@param callback function|nil
+function M.getOrganizationTags(organization_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tags"
+	if callback then
+		M.get_data(endpoint, "GET", nil, nil, callback, 300)
+	else
+		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 300)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+---@class createTagData
+---@field name string
+
+---@param organization_id string
+---@param data createTagData
+---@param callback function|nil
+function M.createTag(organization_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tags"
+	if callback then
+		M.get_data(endpoint, "POST", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "POST", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+--- Retrieves all members of an organization.
+---@param organization_id string
+---@param callback function|nil
+function M.getOrganizationMembers(organization_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/members"
+	if callback then
+		M.get_data(endpoint, "GET", nil, nil, callback, 3600)
+	else
+		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 3600)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+--- Retrieves all clients for an organization.
+---@param organization_id string
+---@param callback function|nil
+function M.getOrganizationClients(organization_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/clients"
+	if callback then
+		M.get_data(endpoint, "GET", nil, nil, callback, 300)
+	else
+		local data, err = M.get_data(endpoint, "GET", nil, nil, nil, 300)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+---@class createClientData
+---@field name string
+
+---@param organization_id string
+---@param data createClientData
+---@param callback function|nil
+function M.createClient(organization_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/clients"
+	if callback then
+		M.get_data(endpoint, "POST", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "POST", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@param organization_id string
+---@param client_id string
+---@param callback function|nil
+function M.deleteClient(organization_id, client_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/clients/" .. client_id
+	if callback then
+		M.get_data(endpoint, "DELETE", nil, nil, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "DELETE", nil, nil, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@param organization_id string
+---@param client_id string
+---@param data table  { name = string }
+---@param callback function|nil
+function M.updateClient(organization_id, client_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/clients/" .. client_id
+	if callback then
+		M.get_data(endpoint, "PUT", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "PUT", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+--- Retrieves a page of time entries for a member.
+---@param organization_id string
+---@param params table|nil  { member_ids=string, page=number, ... }
+---@param callback function|nil
+function M.getOrganizationTimeEntries(organization_id, params, callback)
+	local endpoint = "organizations/" .. organization_id .. "/time-entries"
+	if callback then
+		M.get_data(endpoint, "GET", params, nil, callback, nil)
+	else
+		local data, err = M.get_data(endpoint, "GET", params, nil, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+---@param organization_id string
+---@param time_entry_id string
+---@param callback function|nil
+function M.deleteTimeEntry(organization_id, time_entry_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/time-entries/" .. time_entry_id
+	if callback then
+		M.get_data(endpoint, "DELETE", nil, nil, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "DELETE", nil, nil, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+--- Retrieves all tasks for an organization, optionally filtered by project.
+---@param organization_id string
+---@param params table|nil  { project_id = string }
+---@param callback function|nil
+function M.getOrganizationTasks(organization_id, params, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tasks"
+	if callback then
+		M.get_data(endpoint, "GET", params, nil, callback, nil)
+	else
+		local data, err = M.get_data(endpoint, "GET", params, nil, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return data
+		end
+	end
+end
+
+---@class createTaskData
+---@field name string
+---@field is_done boolean
+---@field project_id string
+
+---@param organization_id string
+---@param data createTaskData
+---@param callback function|nil
+function M.createTask(organization_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tasks"
+	if callback then
+		M.get_data(endpoint, "POST", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "POST", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@param organization_id string
+---@param task_id string
+---@param data table  { name = string, is_done = boolean }
+---@param callback function|nil
+function M.updateTask(organization_id, task_id, data, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tasks/" .. task_id
+	if callback then
+		M.get_data(endpoint, "PUT", nil, data, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "PUT", nil, data, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
+		end
+	end
+end
+
+---@param organization_id string
+---@param task_id string
+---@param callback function|nil
+function M.deleteTask(organization_id, task_id, callback)
+	local endpoint = "organizations/" .. organization_id .. "/tasks/" .. task_id
+	if callback then
+		M.get_data(endpoint, "DELETE", nil, nil, callback, nil)
+	else
+		local response, err = M.get_data(endpoint, "DELETE", nil, nil, nil, nil)
+		if err then
+			return { error = err }
+		else
+			return response
 		end
 	end
 end
