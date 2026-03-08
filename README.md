@@ -25,7 +25,7 @@ A Neovim plugin for [Solidtime](https://www.solidtime.io/) — start, stop, and 
 
 ```lua
 {
-    "nicholasgasior/solidtime.nvim",
+    "nick22985/solidtime.nvim",
     config = function()
         require("solidtime").setup()
     end,
@@ -50,14 +50,14 @@ The shell has six tabs. Press the number key shown in the tab bar to jump direct
  [1:Timer]   2:Status   3:Projects   4:Clients   5:Tasks   6:Entries
 ```
 
-| Key | Action |
-| --- | ------ |
-| `1`–`6` | Switch to that tab |
-| `j` / `k` | Move cursor down / up |
-| `<CR>` | Confirm / edit highlighted item |
-| `a` | Add / create new item |
-| `d` | Delete highlighted item |
-| `q` / `<Esc>` | Close or go back |
+| Key           | Action                          |
+| ------------- | ------------------------------- |
+| `1`–`6`       | Switch to that tab              |
+| `j` / `k`     | Move cursor down / up           |
+| `<CR>`        | Confirm / edit highlighted item |
+| `a`           | Add / create new item           |
+| `d`           | Delete highlighted item         |
+| `q` / `<Esc>` | Close or go back                |
 
 ### Timer tab
 
@@ -157,15 +157,15 @@ Auto-tracking starts and stops timers automatically based on which git repositor
 
 ```json
 {
-    "my-repo": {
-        "solidtime_project_id": "<uuid>",
-        "organization_id": "<uuid>",
-        "member_id": "<uuid>",
-        "auto_start": true,
-        "default_description": "Development",
-        "default_billable": false,
-        "default_tags": []
-    }
+	"my-repo": {
+		"solidtime_project_id": "<uuid>",
+		"organization_id": "<uuid>",
+		"member_id": "<uuid>",
+		"auto_start": true,
+		"default_description": "Development",
+		"default_billable": false,
+		"default_tags": []
+	}
 }
 ```
 
