@@ -389,7 +389,6 @@ local function handle_project(project_name, opts)
 				notify_auto_started(project_name, project_cfg)
 			end
 			reset_idle_timers()
-			-- Fire-and-forget: verify the task (if any) is not already marked done.
 			if ci.task_id then
 				async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
 			end
@@ -431,7 +430,6 @@ local function handle_project(project_name, opts)
 						or nil
 				end
 				reset_idle_timers()
-				-- Fire-and-forget: verify the task (if any) is not already marked done.
 				local adopted_task_id = ci and ci.task_id
 				if adopted_task_id then
 					async_check_task_done(

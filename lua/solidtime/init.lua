@@ -63,38 +63,32 @@ function M.RegisterCommands()
 	vim.api.nvim_create_user_command("SolidTime", function(opts)
 		local subcmd = opts.fargs[1]
 
-		if subcmd == "auth" then
-			auth.prompt_api_key()
-		elseif subcmd == "open" then
+		if not subcmd or subcmd == "open" then
 			buffer.open_tab("timer")
+		elseif subcmd == "auth" then
+			auth.prompt_api_key()
 		elseif subcmd == "start" then
 			buffer.startScreen()
 		elseif subcmd == "stop" then
 			tracker.stop()
 		elseif subcmd == "edit" then
-			buffer.editActiveEntry()
-		elseif subcmd == "tags" then
-			buffer.selectActiveTags()
-		elseif subcmd == "project" then
-			buffer.projectsScreen()
+			buffer.open_tab("timer")
 		elseif subcmd == "unproject" then
 			autotrack.unregister_current_project()
 		elseif subcmd == "projects" then
-			buffer.projectsScreen()
+			buffer.open_tab("projects")
 		elseif subcmd == "clients" then
-			buffer.clientsScreen()
+			buffer.open_tab("clients")
 		elseif subcmd == "entries" then
-			buffer.timeEntriesScreen()
+			buffer.open_tab("entries")
 		elseif subcmd == "tasks" then
 			buffer.open_tab("tasks")
 		elseif subcmd == "status" then
-			buffer.statusScreen()
+			buffer.open_tab("status")
 		elseif subcmd == "reload" then
 			M.reload()
 		else
-			print(
-				"Usage: :SolidTime <auth|open|start|stop|edit|tags|project|unproject|projects|clients|entries|tasks|status|reload>"
-			)
+			print("Usage: :SolidTime [auth|open|start|stop|edit|unproject|projects|clients|entries|tasks|status|reload]")
 		end
 	end, {
 		nargs = "?",
@@ -105,13 +99,11 @@ function M.RegisterCommands()
 				"edit",
 				"entries",
 				"open",
-				"project",
 				"projects",
 				"reload",
 				"start",
 				"status",
 				"stop",
-				"tags",
 				"tasks",
 				"unproject",
 			}
@@ -135,14 +127,4 @@ function M.reload()
 		require("solidtime").setup()
 	end
 end
-function M.open()
-	if not tracker.storage.current_information or not tracker.storage.current_information.organization_id then
-		buffer.selectActiveOrganization(function()
-			buffer.selectActiveProject()
-		end)
-	else
-		buffer.selectActiveProject()
-	end
-end
-
 return M
