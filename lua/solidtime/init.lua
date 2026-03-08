@@ -43,8 +43,8 @@ function M.setup_keymaps()
 	end
 
 	map(km.open, function()
-		M.open()
-	end, "Open SolidTime")
+		buffer.open_tab("timer")
+	end, "Open SolidTime Timer")
 	map(km.start, function()
 		buffer.startScreen()
 	end, "Start SolidTime Timer")
@@ -66,7 +66,7 @@ function M.RegisterCommands()
 		if subcmd == "auth" then
 			auth.prompt_api_key()
 		elseif subcmd == "open" then
-			M.open()
+			buffer.open_tab("timer")
 		elseif subcmd == "start" then
 			buffer.startScreen()
 		elseif subcmd == "stop" then

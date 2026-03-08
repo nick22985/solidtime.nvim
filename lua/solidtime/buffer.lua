@@ -56,18 +56,20 @@ local function shell_close()
 	shell_back_or_close_fn = nil
 end
 
+local DEFAULT_W = 90
+local DEFAULT_H = 26
+
 local function shell_dims()
 	local tab_id = TABS[shell.active_tab] and TABS[shell.active_tab].id or "timer"
 	local sizes = {
-		timer = { w = 60, h = 18 },
-		status = { w = 60, h = 14 },
-		projects = { w = 74, h = 22 },
-		clients = { w = 62, h = 22 },
-		tasks = { w = 66, h = 24 },
-		entries = { w = 92, h = 26 },
+		-- timer = { w = 60, h = 18 },
+		-- status = { w = 60, h = 14 },
+		-- projects = { w = 74, h = 22 },
+		-- clients = { w = 62, h = 22 },
+		-- tasks = { w = 66, h = 24 },
+		-- entries = { w = 92, h = 26 },
 	}
-	local s = sizes[tab_id] or { w = 74, h = 22 }
-	-- clamp to terminal size
+	local s = sizes[tab_id] or { w = DEFAULT_W, h = DEFAULT_H }
 	local w = math.min(s.w, vim.o.columns - 4)
 	local h = math.min(s.h, vim.o.lines - 4)
 	return w, h
@@ -77,9 +79,9 @@ local function tab_bar_lines(inner_width)
 	local parts = {}
 	for i, tab in ipairs(TABS) do
 		if i == shell.active_tab then
-			table.insert(parts, " [" .. tab.label .. "] ")
+			table.insert(parts, " [" .. i .. ":" .. tab.label .. "] ")
 		else
-			table.insert(parts, "  " .. tab.label .. "  ")
+			table.insert(parts, "  " .. i .. ":" .. tab.label .. "  ")
 		end
 	end
 	local bar = table.concat(parts, "")
@@ -3586,8 +3588,6 @@ end
 
 function M.editActiveEntry()
 	M.open_tab("timer")
-	shell.direct_open = true
-	timer_tab_open_edit_form()
 end
 
 function M.statusScreen()
