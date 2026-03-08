@@ -276,10 +276,7 @@ end
 local function edit_tags(org_id, current_ids, on_done)
 	api.getOrganizationTags(org_id, function(err, data)
 		if err or not data or not data.data then
-			vim.notify(
-				"Failed to fetch tags: " .. (err or "unknown error"),
-				vim.log.levels.ERROR
-			)
+			vim.notify("Failed to fetch tags: " .. (err or "unknown error"), vim.log.levels.ERROR)
 			on_done(current_ids)
 			return
 		end
@@ -387,17 +384,16 @@ local function edit_task(org_id, project_id, current_task_id, task_map, on_done)
 		on_done(current_task_id)
 		return
 	end
-	api.getOrganizationTasks(org_id, { project_id = project_id }, function(err, data)
+	api.getOrganizationTasks(org_id, { project_id = project_id, done = "false" }, function(err, data)
 		if err or not data or not data.data then
-			vim.notify(
-				"Failed to fetch tasks: " .. (err or "unknown error"),
-				vim.log.levels.ERROR
-			)
+			vim.notify("Failed to fetch tasks: " .. (err or "unknown error"), vim.log.levels.ERROR)
 			on_done(current_task_id)
 			return
 		end
 		-- Refresh task_map with latest data
-		for k in pairs(task_map) do task_map[k] = nil end
+		for k in pairs(task_map) do
+			task_map[k] = nil
+		end
 		for _, t in ipairs(data.data) do
 			task_map[t.id] = t.name
 		end
@@ -413,7 +409,7 @@ local function edit_task(org_id, project_id, current_task_id, task_map, on_done)
 				if not t.id or t.id == "__new__" then
 					return t.name
 				end
-				return (t.is_done and "[done] " or "") .. t.name
+				return t.name
 			end,
 		}, function(choice)
 			if choice == nil then
@@ -504,7 +500,9 @@ end
 local function edit_project(org_id, current_id, project_map, on_done)
 	api.getOrganizationProjects(org_id, function(err, data)
 		-- Refresh project_map in-place
-		for k in pairs(project_map) do project_map[k] = nil end
+		for k in pairs(project_map) do
+			project_map[k] = nil
+		end
 		if data and data.data then
 			for _, p in ipairs(data.data) do
 				project_map[p.id] = p.name
@@ -792,7 +790,9 @@ local function make_time_entry_fields(org_id, initial, fields_ref, project_map, 
 						end
 					end
 					-- also clear task_map since it was for the old project
-					for k in pairs(task_map) do task_map[k] = nil end
+					for k in pairs(task_map) do
+						task_map[k] = nil
+					end
 				end
 				done(new_pid)
 			end)
@@ -900,7 +900,7 @@ function M.startScreen()
 	end)
 
 	if need_tasks == 1 then
-		api.getOrganizationTasks(org_id, { project_id = ci.project_id }, function(err, data)
+		api.getOrganizationTasks(org_id, { project_id = ci.project_id, done = "false" }, function(err, data)
 			if not err and data and data.data then
 				for _, t in ipairs(data.data) do
 					task_map[t.id] = t.name
@@ -1036,7 +1036,7 @@ function M.editActiveEntry()
 	end)
 
 	if need_tasks == 1 then
-		api.getOrganizationTasks(org_id, { project_id = entry.project_id }, function(err, data)
+		api.getOrganizationTasks(org_id, { project_id = entry.project_id, done = "false" }, function(err, data)
 			if not err and data and data.data then
 				for _, t in ipairs(data.data) do
 					task_map[t.id] = t.name
@@ -1435,7 +1435,10 @@ function M.projectsScreen()
 						default_billable = vals.default_billable or false,
 						default_tags = existing.default_tags or {},
 						organization_id = existing.organization_id
-							or (tracker.storage.current_information and tracker.storage.current_information.organization_id),
+							or (
+								tracker.storage.current_information
+								and tracker.storage.current_information.organization_id
+							),
 						member_id = existing.member_id
 							or (tracker.storage.current_information and tracker.storage.current_information.member_id),
 					}
@@ -1596,8 +1599,8 @@ function M.statusScreen()
 	end
 
 	-- Pre-fetch memberships and projects to avoid sync API calls in display closures
-	local memberships_data = nil   -- populated async before form opens
-	local projects_data = nil      -- populated async before form opens
+	local memberships_data = nil -- populated async before form opens
+	local projects_data = nil -- populated async before form opens
 	local fetched_memberships = 0
 	local fetched_projects = 0
 
@@ -2040,10 +2043,7 @@ function M.tasksScreen(project_id, project_name)
 				project_id = project_id,
 			}, function(err, result)
 				if err or (result and result.error) then
-					vim.notify(
-						"Failed to create task: " .. tostring(err or result.error),
-						vim.log.levels.ERROR
-					)
+					vim.notify("Failed to create task: " .. tostring(err or result.error), vim.log.levels.ERROR)
 					return
 				end
 				if result and result.data then
@@ -2085,13 +2085,14 @@ function M.tasksScreen(project_id, project_name)
 					is_done = not task.is_done,
 				}, function(err, result)
 					if err or (result and result.error) then
-						vim.notify(
-							"Failed to update task: " .. tostring(err or result.error),
-							vim.log.levels.ERROR
-						)
+						vim.notify("Failed to update task: " .. tostring(err or result.error), vim.log.levels.ERROR)
 						return
 					end
-					task.is_done = not task.is_done
+					local marking_done = not task.is_done
+					task.is_done = marking_done
+					if marking_done then
+						require("solidtime.autotrack").clear_done_task(project_id, task.id)
+					end
 					if vim.api.nvim_win_is_valid(win) then
 						redraw()
 						set_cursor_row(idx)
@@ -2109,10 +2110,7 @@ function M.tasksScreen(project_id, project_name)
 						is_done = task.is_done,
 					}, function(err, result)
 						if err or (result and result.error) then
-							vim.notify(
-								"Failed to rename task: " .. tostring(err or result.error),
-								vim.log.levels.ERROR
-							)
+							vim.notify("Failed to rename task: " .. tostring(err or result.error), vim.log.levels.ERROR)
 							return
 						end
 						task.name = name
@@ -2140,10 +2138,7 @@ function M.tasksScreen(project_id, project_name)
 			end
 			api.deleteTask(org_id, task.id, function(err, result)
 				if err or (result and result.error) then
-					vim.notify(
-						"Failed to delete task: " .. tostring(err or result.error),
-						vim.log.levels.ERROR
-					)
+					vim.notify("Failed to delete task: " .. tostring(err or result.error), vim.log.levels.ERROR)
 					return
 				end
 				for i, t in ipairs(tasks) do
@@ -2485,7 +2480,7 @@ function M.timeEntriesScreen()
 		end
 
 		if need_tasks == 1 then
-			api.getOrganizationTasks(org_id, { project_id = entry.project_id }, function(err, data)
+			api.getOrganizationTasks(org_id, { project_id = entry.project_id, done = "false" }, function(err, data)
 				if not err and data and data.data then
 					for _, t in ipairs(data.data) do
 						entry_task_map[t.id] = t.name

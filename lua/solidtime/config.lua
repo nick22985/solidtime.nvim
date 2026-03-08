@@ -24,6 +24,11 @@ M.defaults = {
 		-- Set to 0 to notify immediately (may show the built-in blocking message).
 		startup_notify_delay = 100,
 
+		-- When true, the active timer is stopped on VimLeave if no other Neovim
+		-- instance is open in the same project directory.  Set to false to always
+		-- leave the timer running on exit (the default behaviour before this option).
+		stop_on_exit = true,
+
 		ignore_buftypes = { "nofile", "terminal", "help", "quickfix", "prompt" },
 
 		ignore_buf_patterns = {

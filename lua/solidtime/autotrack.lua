@@ -253,7 +253,82 @@ local function notify_auto_started(project_name, project_cfg)
 	vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "SolidTime" })
 end
 
----@param project_name string
+--- After a timer has been started or adopted, asynchronously verify that the
+--- active task (if any) is not already marked done in Solidtime.  If it is,
+--- patch the running entry to remove the task, update projects.json, and
+--- notify the user — without blocking the start/adopt path at all.
+---@param project_name string   git/cwd project name used for projects.json
+---@param org_id string
+---@param project_id string
+---@param task_id string
+local function async_check_task_done(project_name, org_id, project_id, task_id)
+	if not task_id or task_id == "" then
+		return
+	end
+	local api = require("solidtime.api")
+	api.getOrganizationTasks(org_id, { project_id = project_id, done = "true" }, function(err, result)
+		if err or not result or not result.data then
+			return
+		end
+		local is_done = false
+		for _, t in ipairs(result.data) do
+			if t.id == task_id then
+				is_done = true
+				break
+			end
+		end
+		if not is_done then
+			return
+		end
+
+		vim.schedule(function()
+			logger.info("solidtime autotrack: task " .. task_id .. " is done — clearing from active entry")
+
+			local active = tracker.storage.active_entry
+			if active and active.id and active.organization_id then
+				api.updateTimeEntry(active.organization_id, active.id, {
+					member_id = active.member_id,
+					project_id = active.project_id,
+					task_id = vim.NIL,
+					start = active.start,
+					billable = active.billable,
+					description = active.description,
+					tags = active.tags,
+				}, function(update_err)
+					if update_err then
+						logger.warn(
+							"solidtime autotrack: failed to clear done task from running entry: "
+								.. tostring(update_err)
+						)
+						return
+					end
+					active.task_id = nil
+					logger.info("solidtime autotrack: cleared done task from running server entry")
+				end)
+			end
+
+			local ci = tracker.storage.current_information
+			if ci and ci.task_id == task_id then
+				ci.task_id = nil
+			end
+
+			local projects = read_projects_config()
+			local cfg = projects[project_name]
+			if cfg and cfg.last_task_id == task_id then
+				cfg.last_task_id = nil
+				write_projects_config(projects)
+			end
+
+			vim.notify(
+				"Task was already marked done in Solidtime — timer continues without task.",
+				vim.log.levels.WARN,
+				{ title = "SolidTime" }
+			)
+		end)
+	end)
+end
+
+---@param project_name string  git/cwd project name (for projects.json update)
 ---@param opts? { startup?: boolean }
 local function handle_project(project_name, opts)
 	opts = opts or {}
@@ -314,6 +389,10 @@ local function handle_project(project_name, opts)
 				notify_auto_started(project_name, project_cfg)
 			end
 			reset_idle_timers()
+			-- Fire-and-forget: verify the task (if any) is not already marked done.
+			if ci.task_id then
+				async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
+			end
 		end
 	end
 
@@ -352,6 +431,16 @@ local function handle_project(project_name, opts)
 						or nil
 				end
 				reset_idle_timers()
+				-- Fire-and-forget: verify the task (if any) is not already marked done.
+				local adopted_task_id = ci and ci.task_id
+				if adopted_task_id then
+					async_check_task_done(
+						project_name,
+						project_cfg.organization_id or (ci and ci.organization_id),
+						project_cfg.solidtime_project_id,
+						adopted_task_id
+					)
+				end
 				return
 			end
 			do_stop_and_start()
@@ -470,7 +559,7 @@ function M.register_current_project()
 
 						api.getOrganizationTasks(
 							ci.organization_id,
-							{ project_id = chosen_proj.id },
+							{ project_id = chosen_proj.id, done = "false" },
 							function(task_err, task_result)
 								local task_items = { { id = nil, name = "(None)" } }
 								if not task_err and task_result and task_result.data then
@@ -530,6 +619,59 @@ function M.register_current_project()
 	end)
 end
 
+--- When a task is marked as done, clear last_task_id for any project entry
+--- in projects.json that was using that task, so the next auto-start does not
+--- attempt to track a completed task.
+---@param solidtime_project_id string  the Solidtime project UUID the task belongs to
+---@param task_id string               the task UUID that was just marked done
+function M.clear_done_task(solidtime_project_id, task_id)
+	if not solidtime_project_id or not task_id then
+		return
+	end
+
+	local projects = read_projects_config()
+	local changed = false
+	for _, cfg in pairs(projects) do
+		if cfg.solidtime_project_id == solidtime_project_id and cfg.last_task_id == task_id then
+			cfg.last_task_id = nil
+			changed = true
+		end
+	end
+	if changed then
+		write_projects_config(projects)
+		logger.info("solidtime autotrack: cleared last_task_id for completed task " .. task_id)
+	end
+
+	local t = require("solidtime.tracker")
+	local ci = t.storage.current_information
+	if ci and ci.task_id == task_id and ci.project_id == solidtime_project_id then
+		ci.task_id = nil
+	end
+
+	local active = t.storage.active_entry
+	if active and active.task_id == task_id and active.project_id == solidtime_project_id then
+		active.task_id = nil
+		if active.id and active.organization_id then
+			local api = require("solidtime.api")
+			api.updateTimeEntry(active.organization_id, active.id, {
+				member_id = active.member_id,
+				project_id = active.project_id,
+				task_id = vim.NIL,
+				start = active.start,
+				billable = active.billable,
+				description = active.description,
+				tags = active.tags,
+			}, function(err)
+				if err then
+					logger.warn("solidtime autotrack: failed to clear task from running entry: " .. tostring(err))
+				else
+					logger.info("solidtime autotrack: cleared task from running server entry")
+				end
+			end)
+		end
+	end
+end
+
 function M.unregister_current_project()
 	local project_name = M.detect_project()
 	if not project_name then
@@ -556,6 +698,32 @@ function M.init()
 		once = true,
 		callback = function()
 			M.on_project_change({ startup = true })
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("VimLeavePre", {
+		group = augroup,
+		once = true,
+		callback = function()
+			local cfg = config.get()
+			local at_cfg = cfg.autotrack or {}
+			if not at_cfg.stop_on_exit then
+				return
+			end
+			if not tracker.storage.active_entry then
+				return
+			end
+			local project_dir = vim.fn.getcwd()
+			if ipc.has_peer_in_project(project_dir) then
+				logger.info(
+					"solidtime autotrack: exit — another nvim is open in '"
+						.. project_dir
+						.. "', leaving timer running"
+				)
+				return
+			end
+			logger.info("solidtime autotrack: exit — stopping timer (no other nvim in project)")
+			tracker.stop({ pause_autotrack = false })
 		end,
 	})
 

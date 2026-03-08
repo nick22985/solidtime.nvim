@@ -7,7 +7,9 @@ local function own_socket()
 	return (s and s ~= "") and s or nil
 end
 
----@return string[]
+--- Each entry in the registry is { socket = "...", project_dir = "..." }.
+--- Older entries that are plain strings are tolerated for backward compatibility.
+---@return table[]
 local function read_registry()
 	if not registry_file then
 		return {}
@@ -25,11 +27,20 @@ local function read_registry()
 	if not ok or type(decoded) ~= "table" then
 		return {}
 	end
-	return decoded
+	-- Migrate plain-string entries from older format to table entries.
+	local migrated = {}
+	for _, entry in ipairs(decoded) do
+		if type(entry) == "string" then
+			table.insert(migrated, { socket = entry, project_dir = nil })
+		else
+			table.insert(migrated, entry)
+		end
+	end
+	return migrated
 end
 
----@param sockets string[]
-local function write_registry(sockets)
+---@param entries table[]
+local function write_registry(entries)
 	if not registry_file then
 		return
 	end
@@ -39,7 +50,7 @@ local function write_registry(sockets)
 	if not f then
 		return
 	end
-	f:write(vim.fn.json_encode(sockets))
+	f:write(vim.fn.json_encode(entries))
 	f:close()
 end
 
@@ -61,17 +72,19 @@ local function is_socket_alive(socket_path)
 	return true
 end
 
----@return string[]  live peer socket paths
-local function live_peers()
+--- Returns all live registry entries (including own), pruning dead ones.
+---@return table[]
+local function live_entries()
 	local all = read_registry()
 	local live = {}
 	local changed = false
 
-	for _, s in ipairs(all) do
-		if s == own_socket() then
-			table.insert(live, s)
-		elseif is_socket_alive(s) then
-			table.insert(live, s)
+	for _, entry in ipairs(all) do
+		local sock = entry.socket
+		if sock == own_socket() then
+			table.insert(live, entry)
+		elseif is_socket_alive(sock) then
+			table.insert(live, entry)
 		else
 			changed = true
 		end
@@ -81,14 +94,38 @@ local function live_peers()
 		write_registry(live)
 	end
 
+	return live
+end
+
+---@return string[]  live peer socket paths (excluding self)
+local function live_peers()
+	local entries = live_entries()
 	local peers = {}
 	local me = own_socket()
-	for _, s in ipairs(live) do
-		if s ~= me then
-			table.insert(peers, s)
+	for _, entry in ipairs(entries) do
+		if entry.socket ~= me then
+			table.insert(peers, entry.socket)
 		end
 	end
 	return peers
+end
+
+--- Returns true when at least one other live Neovim instance is registered
+--- with the same project_dir as this instance.
+---@param project_dir string
+---@return boolean
+function M.has_peer_in_project(project_dir)
+	if not project_dir or project_dir == "" then
+		return false
+	end
+	local entries = live_entries()
+	local me = own_socket()
+	for _, entry in ipairs(entries) do
+		if entry.socket ~= me and entry.project_dir == project_dir then
+			return true
+		end
+	end
+	return false
 end
 
 function M.register()
@@ -97,14 +134,18 @@ function M.register()
 		return
 	end
 
+	local project_dir = vim.fn.getcwd()
+
 	local all = read_registry()
-	-- Avoid duplicates
-	for _, s in ipairs(all) do
-		if s == me then
+	-- Update existing entry for this socket if present, otherwise append.
+	for _, entry in ipairs(all) do
+		if entry.socket == me then
+			entry.project_dir = project_dir
+			write_registry(all)
 			return
 		end
 	end
-	table.insert(all, me)
+	table.insert(all, { socket = me, project_dir = project_dir })
 	write_registry(all)
 end
 
@@ -116,9 +157,9 @@ function M.unregister()
 
 	local all = read_registry()
 	local filtered = {}
-	for _, s in ipairs(all) do
-		if s ~= me then
-			table.insert(filtered, s)
+	for _, entry in ipairs(all) do
+		if entry.socket ~= me then
+			table.insert(filtered, entry)
 		end
 	end
 	write_registry(filtered)
