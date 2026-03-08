@@ -16,7 +16,231 @@ end
 
 local M = {}
 
-local LIST_HEADER_LINES = 2
+local TABS = {
+	{ id = "timer", label = "Timer" },
+	{ id = "status", label = "Status" },
+	{ id = "projects", label = "Projects" },
+	{ id = "clients", label = "Clients" },
+	{ id = "tasks", label = "Tasks" },
+	{ id = "entries", label = "Entries" },
+}
+
+local shell_back_or_close_fn = nil
+
+local shell = {
+	win = nil,
+	buf = nil,
+	active_tab = 1,
+	stack = {},
+	direct_open = false,
+}
+
+local TAB_BAR_LINES = 2
+local LIST_HEADER_LINES = TAB_BAR_LINES + 2
+
+local function shell_is_open()
+	return shell.win ~= nil
+		and vim.api.nvim_win_is_valid(shell.win)
+		and shell.buf ~= nil
+		and vim.api.nvim_buf_is_valid(shell.buf)
+end
+
+local function shell_close()
+	if shell.win and vim.api.nvim_win_is_valid(shell.win) then
+		vim.api.nvim_win_close(shell.win, true)
+	end
+	shell.win = nil
+	shell.buf = nil
+	shell.stack = {}
+	shell.direct_open = false
+	shell_back_or_close_fn = nil
+end
+
+local function shell_dims()
+	local tab_id = TABS[shell.active_tab] and TABS[shell.active_tab].id or "timer"
+	local sizes = {
+		timer = { w = 60, h = 18 },
+		status = { w = 60, h = 14 },
+		projects = { w = 74, h = 22 },
+		clients = { w = 62, h = 22 },
+		tasks = { w = 66, h = 24 },
+		entries = { w = 92, h = 26 },
+	}
+	local s = sizes[tab_id] or { w = 74, h = 22 }
+	-- clamp to terminal size
+	local w = math.min(s.w, vim.o.columns - 4)
+	local h = math.min(s.h, vim.o.lines - 4)
+	return w, h
+end
+
+local function tab_bar_lines(inner_width)
+	local parts = {}
+	for i, tab in ipairs(TABS) do
+		if i == shell.active_tab then
+			table.insert(parts, " [" .. tab.label .. "] ")
+		else
+			table.insert(parts, "  " .. tab.label .. "  ")
+		end
+	end
+	local bar = table.concat(parts, "")
+	if #bar < inner_width then
+		bar = bar .. string.rep(" ", inner_width - #bar)
+	elseif #bar > inner_width then
+		bar = bar:sub(1, inner_width)
+	end
+	return { bar, string.rep("─", inner_width) }
+end
+
+local function buf_set_lines(buf, lines)
+	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+end
+
+local function shell_redraw()
+	if not shell_is_open() then
+		return
+	end
+	local saved_cursor = vim.api.nvim_win_get_cursor(shell.win)
+	local w = vim.api.nvim_win_get_width(shell.win) - 2
+	local lines = tab_bar_lines(w)
+	local top = shell.stack[#shell.stack]
+	if top and top.render then
+		local content = top.render(w)
+		for _, l in ipairs(content) do
+			table.insert(lines, l)
+		end
+	end
+	buf_set_lines(shell.buf, lines)
+	local line_count = vim.api.nvim_buf_line_count(shell.buf)
+	local restore_line = math.min(saved_cursor[1], line_count)
+	if restore_line >= 1 then
+		vim.api.nvim_win_set_cursor(shell.win, { restore_line, saved_cursor[2] })
+	end
+	if top and top.install_keymaps then
+		top.install_keymaps()
+	end
+	if shell_back_or_close_fn and not (top and top.owns_cancel) then
+		bmap(shell.buf, km().close, shell_back_or_close_fn, "Back / Close")
+		bmap(shell.buf, km().close_alt, shell_back_or_close_fn, "Back / Close")
+	end
+end
+
+local function shell_open(tab_idx)
+	tab_idx = tab_idx or shell.active_tab
+
+	if shell_is_open() then
+		shell.active_tab = tab_idx
+		shell.stack = {}
+		return
+	end
+
+	shell.active_tab = tab_idx
+	shell.stack = {}
+
+	local w, h = shell_dims()
+	local row = math.floor((vim.o.lines - h) / 2)
+	local col = math.floor((vim.o.columns - w) / 2)
+
+	local buf = vim.api.nvim_create_buf(false, true)
+	local win = vim.api.nvim_open_win(buf, true, {
+		relative = "editor",
+		width = w,
+		height = h,
+		row = row,
+		col = col,
+		style = "minimal",
+		border = "rounded",
+		title = " SolidTime ",
+		title_pos = "center",
+	})
+
+	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+	vim.api.nvim_set_option_value("cursorline", true, { win = win })
+
+	shell.win = win
+	shell.buf = buf
+
+	vim.api.nvim_create_autocmd("WinClosed", {
+		pattern = tostring(win),
+		once = true,
+		callback = function()
+			shell.win = nil
+			shell.buf = nil
+			shell.stack = {}
+			shell.direct_open = false
+		end,
+	})
+	vim.keymap.set("n", "gg", function() end, { buffer = buf, nowait = true })
+	vim.keymap.set("n", "G", function() end, { buffer = buf, nowait = true })
+
+	local function back_or_close()
+		if not shell.direct_open and #shell.stack > 1 then
+			local top = shell.stack[#shell.stack]
+			if top and top.on_pop then
+				top.on_pop()
+			end
+			table.remove(shell.stack)
+			shell_resize_for_tab()
+			shell_redraw()
+			vim.api.nvim_win_set_cursor(shell.win, { LIST_HEADER_LINES + 1, 2 })
+		else
+			shell_close()
+		end
+	end
+	shell_back_or_close_fn = back_or_close
+	bmap(buf, km().close, back_or_close, "Back / Close")
+	bmap(buf, km().close_alt, back_or_close, "Back / Close")
+
+	for i = 1, #TABS do
+		local idx = i
+		vim.keymap.set("n", tostring(i), function()
+			M.switch_tab(idx)
+		end, { buffer = buf, nowait = true, desc = "Switch to tab " .. TABS[idx].label })
+	end
+end
+
+function shell_resize_for_tab()
+	if not shell_is_open() then
+		return
+	end
+	local w, h = shell_dims()
+	w = math.min(w, vim.o.columns - 4)
+	h = math.min(h, vim.o.lines - 4)
+	local row = math.floor((vim.o.lines - h) / 2)
+	local col = math.floor((vim.o.columns - w) / 2)
+	vim.api.nvim_win_set_config(shell.win, {
+		relative = "editor",
+		width = w,
+		height = h,
+		row = row,
+		col = col,
+	})
+end
+
+local function shell_push(view)
+	table.insert(shell.stack, view)
+	shell_redraw()
+end
+
+function M.switch_tab(tab_idx)
+	if not shell_is_open() then
+		M.open_tab(tab_idx)
+		return
+	end
+	shell.active_tab = tab_idx
+	shell.stack = {}
+	shell.direct_open = false
+	shell_resize_for_tab()
+	local tab = TABS[tab_idx]
+	if tab then
+		local launcher = M["_tab_" .. tab.id]
+		if launcher then
+			launcher()
+		end
+	end
+end
 
 local PROJECT_COLORS = {
 	{ label = "Blue", value = "#3b82f6" },
@@ -37,29 +261,23 @@ local function pad(s, n)
 	return s .. string.rep(" ", n - #s)
 end
 
-local function list_set_lines(buf, lines)
-	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-end
-
-local function list_close(win)
-	if vim.api.nvim_win_is_valid(win) then
-		vim.api.nvim_win_close(win, true)
+local function list_set_cursor(row_idx)
+	if not shell_is_open() then
+		return
 	end
-end
-
-local function list_set_cursor(win, idx)
-	if vim.api.nvim_win_is_valid(win) then
-		vim.api.nvim_win_set_cursor(win, { LIST_HEADER_LINES + idx, 2 })
+	local target = LIST_HEADER_LINES + row_idx
+	local line_count = vim.api.nvim_buf_line_count(shell.buf)
+	if target < 1 or target > line_count then
+		return
 	end
+	vim.api.nvim_win_set_cursor(shell.win, { target, 2 })
 end
 
-local function list_current_idx(win, rows)
-	if not vim.api.nvim_win_is_valid(win) then
+local function list_current_idx(rows)
+	if not shell_is_open() then
 		return nil
 	end
-	local cur = vim.api.nvim_win_get_cursor(win)[1]
+	local cur = vim.api.nvim_win_get_cursor(shell.win)[1]
 	local idx = cur - LIST_HEADER_LINES
 	if idx < 1 or idx > #rows then
 		return nil
@@ -77,151 +295,96 @@ local function fields_to_vals(f)
 	return vals
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Form engine
--- ─────────────────────────────────────────────────────────────────────────────
---
--- A "field" is a table:
---   { key = string, label = string, value = any, display = function(v)->string,
---     edit = function(current_value, on_done) }
---
--- `edit` receives the current value and a callback on_done(new_value).
--- Sentinel fields (separators, action rows) have key = nil.
---
--- open_form opens a compact floating window, renders the fields, lets the user
--- navigate with j/k and confirm each field with <CR>.  The action row (last
--- non-separator field) calls on_confirm with the final state when activated.
+local LABEL_WIDTH = 14
 
-local FORM_WIDTH = 56 -- total inner width of the form window
-local LABEL_WIDTH = 14 -- characters reserved for the label column
-
-local function form_render_lines(fields, title)
-	local inner = FORM_WIDTH
+local function form_render_lines(fields, inner_w)
 	local lines = {}
-
-	local pad = math.floor((inner - #title) / 2)
-	table.insert(lines, string.rep(" ", pad) .. title)
-	table.insert(lines, string.rep("─", inner))
+	local sep_line = string.rep("─", inner_w)
 
 	for _, field in ipairs(fields) do
 		if field.key == "__sep__" then
-			table.insert(lines, string.rep("─", inner))
+			table.insert(lines, sep_line)
 		elseif field.key == "__action__" then
 			local lbl = "  " .. field.label .. "  "
-			local apad = math.floor((inner - #lbl) / 2)
-			table.insert(lines, string.rep(" ", apad) .. lbl)
+			local apad = math.floor((inner_w - #lbl) / 2)
+			table.insert(lines, string.rep(" ", math.max(0, apad)) .. lbl)
 		else
 			local label_col = string.format("  %-" .. LABEL_WIDTH .. "s", field.label)
 			local sep = "│ "
-			local _raw = field.display and field.display(field.value) or field.value
-			local value_str = (type(_raw) == "string") and _raw or ""
-			local max_val = inner - #label_col - #sep - 1
-			if #value_str > max_val then
+			local raw = field.display and field.display(field.value) or field.value
+			local value_str = (type(raw) == "string") and raw or ""
+			local max_val = inner_w - #label_col - #sep - 1
+			if max_val > 0 and #value_str > max_val then
 				value_str = value_str:sub(1, max_val - 1) .. "…"
 			end
 			table.insert(lines, label_col .. sep .. value_str)
 		end
 	end
-
 	return lines
 end
 
-local function form_editable_indices(fields, title_lines)
-	local indices = {}
-	local line = title_lines -- 0-based
+local function form_nav(fields)
+	local nav = {}
+	local line = 0
 	for _, field in ipairs(fields) do
 		if field.key == "__sep__" then
 			line = line + 1
-		elseif field.key == "__action__" then
-			table.insert(indices, { line = line, field = field })
-			line = line + 1
 		else
-			table.insert(indices, { line = line, field = field })
+			table.insert(nav, { line = line, field = field })
 			line = line + 1
 		end
 	end
-	return indices
+	return nav
 end
 
 ---@class FormField
----@field key string|nil  nil = separator  "__action__" = confirm button
+---@field key string|nil
 ---@field label string
 ---@field value any
----@field display function|nil  (value) -> string
----@field edit function|nil     (value, on_done) -> nil
+---@field display function|nil
+---@field edit function|nil
 
---- Open a form floating window.
+--- Open a form inline in the shell.
 ---@param fields FormField[]
 ---@param title string
----@param on_confirm function  called with the final fields table when action row is <CR>'d
+---@param on_confirm function
 local function open_form(fields, title, on_confirm)
-	local HEADER_LINES = 2 -- title + separator
-	local height = HEADER_LINES + #fields + 2 -- +2 for padding
-	local width = FORM_WIDTH + 2 -- account for border
-
-	local row = math.floor((vim.o.lines - height) / 2)
-	local col = math.floor((vim.o.columns - width) / 2)
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = width,
-		height = height,
-		row = row,
-		col = col,
-		style = "minimal",
-		border = "rounded",
-		title = " " .. title .. " ",
-		title_pos = "center",
-	})
-
-	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("cursorline", true, { win = win })
-
-	local function redraw()
-		local lines = form_render_lines(fields, title)
-		vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-		vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-	end
-
-	redraw()
-
-	local nav = form_editable_indices(fields, HEADER_LINES)
-
 	local cursor_idx = 1
-	local function set_cursor()
-		if nav[cursor_idx] then
-			vim.api.nvim_win_set_cursor(win, { nav[cursor_idx].line + 1, 2 })
+	local form_active = true
+
+	local content_start = TAB_BAR_LINES -- 0-based
+
+	local function set_cursor(nav)
+		if not shell_is_open() or not form_active then
+			return
+		end
+		local entry = nav[cursor_idx]
+		if entry then
+			local target = content_start + 2 + entry.line + 1
+			local line_count = vim.api.nvim_buf_line_count(shell.buf)
+			if target >= 1 and target <= line_count then
+				vim.api.nvim_win_set_cursor(shell.win, { target, 2 })
+			end
 		end
 	end
-	set_cursor()
 
-	local function close()
-		if vim.api.nvim_win_is_valid(win) then
-			vim.api.nvim_win_close(win, true)
+	local function render(inner_w)
+		local lines = {}
+		local title_pad = math.floor((inner_w - #title) / 2)
+		table.insert(lines, string.rep(" ", math.max(0, title_pad)) .. title)
+		table.insert(lines, string.rep("─", inner_w))
+		local field_lines = form_render_lines(fields, inner_w)
+		for _, l in ipairs(field_lines) do
+			table.insert(lines, l)
 		end
+		table.insert(lines, "")
+		table.insert(lines, string.rep(" ", math.floor(inner_w / 2) - 3) .. "q/Esc: back")
+		return lines
 	end
 
-	bmap(buf, km().nav_down, function()
-		if cursor_idx < #nav then
-			cursor_idx = cursor_idx + 1
-			set_cursor()
-		end
-	end, "Next field")
+	local nav = form_nav(fields)
 
-	bmap(buf, km().nav_up, function()
-		if cursor_idx > 1 then
-			cursor_idx = cursor_idx - 1
-			set_cursor()
-		end
-	end, "Previous field")
-
-	bmap(buf, km().close, close, "Close form")
-	bmap(buf, km().close_alt, close, "Close form")
-
-	bmap(buf, km().confirm, function()
+	local function confirm_field()
 		local item = nav[cursor_idx]
 		if not item then
 			return
@@ -229,43 +392,264 @@ local function open_form(fields, title, on_confirm)
 		local field = item.field
 
 		if field.key == "__action__" then
-			close()
+			form_active = false
+			table.remove(shell.stack)
+			shell_resize_for_tab()
 			on_confirm(fields)
+			shell_redraw()
+			return
+		end
+
+		if field.inline_edit then
+			if not shell_is_open() then
+				return
+			end
+			local buf = shell.buf
+			local lnum = content_start + 2 + item.line + 1
+			local label_col = string.format("  %-" .. LABEL_WIDTH .. "s", field.label)
+			local prefix = label_col .. "│ "
+			local current_val = (field.value ~= nil and tostring(field.value)) or ""
+			vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+			vim.api.nvim_buf_set_lines(buf, lnum - 1, lnum, false, { prefix .. current_val })
+			vim.api.nvim_win_set_cursor(shell.win, { lnum, #prefix + #current_val })
+			vim.cmd("startinsert!")
+			vim.keymap.set("i", "<CR>", "<Esc>", { buffer = buf, nowait = true })
+			vim.api.nvim_create_autocmd("InsertLeave", {
+				buffer = buf,
+				once = true,
+				callback = function()
+					pcall(vim.keymap.del, "i", "<CR>", { buffer = buf })
+					if not shell_is_open() then
+						return
+					end
+					local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+					vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+					local sep_pos = line:find("│ ")
+					local new_val
+					if sep_pos then
+						new_val = line:sub(sep_pos + 3)
+					else
+						new_val = line:match("^%s*(.-)%s*$") or ""
+					end
+					new_val = new_val:match("^%s*(.-)%s*$") or ""
+					field.value = new_val ~= "" and new_val or nil
+					shell_redraw()
+					vim.schedule(function()
+						if shell_is_open() then
+							set_cursor(nav)
+						end
+					end)
+				end,
+			})
 			return
 		end
 
 		if not field.edit then
 			return
 		end
-
 		field.edit(field.value, function(new_value)
 			field.value = new_value
-			redraw()
+			shell_redraw()
 			vim.schedule(function()
-				if vim.api.nvim_win_is_valid(win) then
-					vim.api.nvim_set_current_win(win)
-					set_cursor()
+				if shell_is_open() then
+					set_cursor(nav)
 				end
 			end)
 		end)
-	end, "Confirm / edit field")
-end
+	end
 
-local function edit_description(current, on_done)
-	vim.ui.input({ prompt = "Description: ", default = current or "" }, function(val)
-		if val == nil then
+	local function nav_down()
+		if cursor_idx < #nav then
+			cursor_idx = cursor_idx + 1
+			set_cursor(nav)
+		end
+	end
+
+	local function nav_up()
+		if cursor_idx > 1 then
+			cursor_idx = cursor_idx - 1
+			set_cursor(nav)
+		end
+	end
+
+	local function install_keymaps()
+		if not shell_is_open() then
 			return
 		end
-		val = val:match("^%s*(.-)%s*$")
-		on_done(val == "" and nil or val)
+		local buf = shell.buf
+		bmap(buf, km().nav_down, nav_down, "Next field")
+		bmap(buf, km().nav_up, nav_up, "Previous field")
+		bmap(buf, km().confirm, confirm_field, "Confirm field")
+		vim.keymap.set("n", "gg", function()
+			cursor_idx = 1
+			set_cursor(nav)
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			cursor_idx = #nav
+			set_cursor(nav)
+		end, { buffer = buf, nowait = true })
+	end
+
+	local view = {
+		render = render,
+		install_keymaps = install_keymaps,
+		on_pop = function()
+			form_active = false
+		end,
+	}
+	shell_push(view)
+	vim.schedule(function()
+		set_cursor(nav)
 	end)
 end
 
+local function shell_select(items, opts, on_choice)
+	local prompt = (opts and opts.prompt) or "Select:"
+	local format_item = (opts and opts.format_item)
+		or function(x)
+			return type(x) == "string" and x or tostring(x)
+		end
+	local rows = {}
+	local sel_idx = (opts and opts.initial_idx) or 1
+
+	local function render(inner_w)
+		rows = {}
+		local lines = { "  " .. prompt, string.rep("─", inner_w) }
+		for _, item in ipairs(items) do
+			table.insert(rows, item)
+			table.insert(lines, "  " .. format_item(item))
+		end
+		table.insert(lines, string.rep("─", inner_w))
+		table.insert(lines, "  <CR> select   q/Esc cancel")
+		return lines
+	end
+
+	local function install_keymaps()
+		if not shell_is_open() then
+			return
+		end
+		local buf = shell.buf
+
+		bmap(buf, km().nav_down, function()
+			local idx = list_current_idx(rows)
+			if idx and idx < #rows then
+				list_set_cursor(idx + 1)
+			end
+		end, "Next item")
+
+		bmap(buf, km().nav_up, function()
+			local idx = list_current_idx(rows)
+			if idx and idx > 1 then
+				list_set_cursor(idx - 1)
+			end
+		end, "Previous item")
+
+		vim.keymap.set("n", "gg", function()
+			if #rows > 0 then
+				list_set_cursor(1)
+			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			if #rows > 0 then
+				list_set_cursor(#rows)
+			end
+		end, { buffer = buf, nowait = true })
+
+		bmap(buf, km().confirm, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local chosen = rows[idx]
+			table.remove(shell.stack)
+			shell_redraw()
+			vim.schedule(function()
+				on_choice(chosen, idx)
+			end)
+		end, "Select item")
+
+		-- q / Esc cancel
+		local function cancel()
+			table.remove(shell.stack)
+			shell_redraw()
+			vim.schedule(function()
+				on_choice(nil, nil)
+			end)
+		end
+		vim.keymap.set("n", "q", cancel, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<Esc>", cancel, { buffer = buf, nowait = true })
+	end
+
+	shell_push({ render = render, install_keymaps = install_keymaps, owns_cancel = true })
+	vim.schedule(function()
+		if shell_is_open() then
+			list_set_cursor(sel_idx)
+		end
+	end)
+end
+
+local function shell_input(prompt, default, on_done)
+	local value = default or ""
+
+	local function render(inner_w)
+		return {
+			"  " .. prompt,
+			string.rep("─", inner_w),
+			"  " .. value,
+			string.rep("─", inner_w),
+			"  <CR>/<Esc> confirm   Ctrl-C cancel",
+		}
+	end
+
+	local function install_keymaps()
+		if not shell_is_open() then
+			return
+		end
+		local buf = shell.buf
+		local lnum = TAB_BAR_LINES + 3
+
+		for _, k in ipairs({ km().close, km().close_alt }) do
+			vim.keymap.set("n", k, function() end, { buffer = buf, nowait = true })
+		end
+
+		local function activate()
+			if not shell_is_open() then
+				return
+			end
+			vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+			vim.api.nvim_buf_set_lines(buf, lnum - 1, lnum, false, { "  " .. value })
+			vim.api.nvim_win_set_cursor(shell.win, { lnum, 2 + #value })
+			vim.keymap.set("i", "<CR>", "<Esc>", { buffer = buf, nowait = true })
+			vim.cmd("startinsert!")
+
+			vim.api.nvim_create_autocmd("InsertLeave", {
+				buffer = buf,
+				once = true,
+				callback = function()
+					pcall(vim.keymap.del, "i", "<CR>", { buffer = buf })
+					if not shell_is_open() then
+						return
+					end
+					local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+					vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+					local raw = line:match("^%s*(.-)%s*$") or ""
+					table.remove(shell.stack)
+					shell_redraw()
+					vim.schedule(function()
+						on_done(raw ~= "" and raw or nil)
+					end)
+				end,
+			})
+		end
+
+		vim.schedule(activate)
+	end
+
+	shell_push({ render = render, install_keymaps = install_keymaps })
+end
+
 local function edit_billable(current, on_done)
-	local choices = { "No", "Yes" }
-	vim.ui.select(choices, {
-		prompt = "Billable?",
-	}, function(choice)
+	shell_select({ "No", "Yes" }, { prompt = "Billable?" }, function(choice)
 		if choice == nil then
 			return
 		end
@@ -289,7 +673,7 @@ local function edit_tags(org_id, current_ids, on_done)
 			end
 		end
 
-		local function loop()
+		local function loop(restore_idx)
 			local items = {}
 			for _, tag in ipairs(all_tags) do
 				table.insert(items, tag)
@@ -297,28 +681,34 @@ local function edit_tags(org_id, current_ids, on_done)
 			table.insert(items, { id = "__new__", name = "+ Create new tag…" })
 			table.insert(items, { id = "__done__", name = "Done" })
 
-			vim.ui.select(items, {
+			shell_select(items, {
 				prompt = "Tags (toggle, then Done):",
+				initial_idx = restore_idx or 1,
 				format_item = function(item)
 					if item.id == "__new__" or item.id == "__done__" then
 						return item.name
 					end
 					return (selected[item.id] and "[x] " or "[ ] ") .. item.name
 				end,
-			}, function(chosen)
+			}, function(chosen, chosen_idx)
 				if chosen == nil or chosen.id == "__done__" then
 					local ids = {}
 					for id in pairs(selected) do
 						table.insert(ids, id)
 					end
-					on_done(#ids > 0 and ids or nil)
+					local refreshed = {}
+					for _, tag in ipairs(all_tags) do
+						refreshed[tag.id] = tag.name
+					end
+					on_done(#ids > 0 and ids or nil, refreshed)
 				elseif chosen.id == "__new__" then
-					vim.ui.input({ prompt = "New tag name: " }, function(name)
-						if not name or name:match("^%s*$") then
-							loop()
+					shell_input("New tag name:", "", function(name)
+						if not name then
+							vim.schedule(function()
+								loop(chosen_idx)
+							end)
 							return
 						end
-						name = name:match("^%s*(.-)%s*$")
 						api.createTag(org_id, { name = name }, function(cerr, cdata)
 							if cdata and cdata.data then
 								cache.invalidate_cache("organizations/" .. org_id .. "/tags")
@@ -328,21 +718,23 @@ local function edit_tags(org_id, current_ids, on_done)
 							elseif cerr then
 								vim.notify("Failed to create tag: " .. cerr, vim.log.levels.ERROR)
 							end
-							loop()
+							vim.schedule(function()
+								loop(chosen_idx)
+							end)
 						end)
 					end)
 				else
-					selected[chosen.id] = selected[chosen.id] and nil or true
-					loop()
+					selected[chosen.id] = not selected[chosen.id] and true or nil
+					vim.schedule(function()
+						loop(chosen_idx)
+					end)
 				end
 			end)
 		end
-
-		loop()
+		loop(1)
 	end)
 end
 
--- Returns a display string for a list of tag ids from a pre-fetched id→name map.
 local function display_tags(tag_map, ids)
 	if not ids or type(ids) ~= "table" or #ids == 0 then
 		return "(none)"
@@ -354,7 +746,6 @@ local function display_tags(tag_map, ids)
 	return table.concat(names, ", ")
 end
 
--- Returns a display string for a project id from a pre-fetched id→name map.
 local function display_project(project_map, project_id)
 	if not project_id then
 		return "(none)"
@@ -362,7 +753,6 @@ local function display_project(project_map, project_id)
 	return project_map[project_id] or project_id
 end
 
--- Returns a display string for a task id from a pre-fetched id→name map.
 local function display_task(task_map, task_id)
 	if not task_id then
 		return "(none)"
@@ -370,14 +760,6 @@ local function display_task(task_map, task_id)
 	return task_map[task_id] or task_id
 end
 
--- Task picker: single-select from tasks belonging to project_id.
--- Returns the chosen task_id (or nil) via on_done.
--- Also updates task_map in-place when a new task is created.
----@param org_id string
----@param project_id string|nil
----@param current_task_id string|nil
----@param task_map table  id→name, updated when new task created
----@param on_done function
 local function edit_task(org_id, project_id, current_task_id, task_map, on_done)
 	if not project_id then
 		vim.notify("Select a project first.", vim.log.levels.WARN)
@@ -390,7 +772,6 @@ local function edit_task(org_id, project_id, current_task_id, task_map, on_done)
 			on_done(current_task_id)
 			return
 		end
-		-- Refresh task_map with latest data
 		for k in pairs(task_map) do
 			task_map[k] = nil
 		end
@@ -403,67 +784,59 @@ local function edit_task(org_id, project_id, current_task_id, task_map, on_done)
 			table.insert(items, t)
 		end
 		table.insert(items, { id = "__new__", name = "+ Create new task…" })
-		vim.ui.select(items, {
-			prompt = "Task:",
-			format_item = function(t)
-				if not t.id or t.id == "__new__" then
+		vim.schedule(function()
+			shell_select(items, {
+				prompt = "Task:",
+				format_item = function(t)
 					return t.name
+				end,
+			}, function(choice)
+				if choice == nil then
+					on_done(current_task_id)
+					return
 				end
-				return t.name
-			end,
-		}, function(choice)
-			if choice == nil then
-				on_done(current_task_id)
-				return
-			end
-			if choice.id == "__new__" then
-				vim.ui.input({ prompt = "New task name: " }, function(name)
-					if not name or name:match("^%s*$") then
-						on_done(current_task_id)
-						return
-					end
-					name = name:match("^%s*(.-)%s*$")
-					api.createTask(org_id, {
-						name = name,
-						is_done = false,
-						project_id = project_id,
-					}, function(cerr, cdata)
-						if cerr then
-							vim.notify("Failed to create task: " .. cerr, vim.log.levels.ERROR)
+				if choice.id == "__new__" then
+					shell_input("New task name: ", "", function(name)
+						if not name or name:match("^%s*$") then
 							on_done(current_task_id)
 							return
 						end
-						local new_id = cdata and cdata.data and cdata.data.id
-						if new_id then
-							task_map[new_id] = name
-							vim.notify("Task created: " .. name, vim.log.levels.INFO)
-							on_done(new_id)
-						else
-							on_done(current_task_id)
-						end
+						name = name:match("^%s*(.-)%s*$")
+						api.createTask(
+							org_id,
+							{ name = name, is_done = false, project_id = project_id },
+							function(cerr, cdata)
+								if cerr then
+									vim.notify("Failed to create task: " .. cerr, vim.log.levels.ERROR)
+									on_done(current_task_id)
+									return
+								end
+								local new_id = cdata and cdata.data and cdata.data.id
+								if new_id then
+									task_map[new_id] = name
+									vim.notify("Task created: " .. name, vim.log.levels.INFO)
+									on_done(new_id)
+								else
+									on_done(current_task_id)
+								end
+							end
+						)
 					end)
-				end)
-				return
-			end
-			on_done(choice.id)
+					return
+				end
+				on_done(choice.id)
+			end)
 		end)
 	end)
 end
 
---- Show a client picker for org_id.
---- Includes "(no client)" and "+ Create new client…" options.
---- Calls done(client_id_or_nil) when the user picks or cancels.
----@param org_id string
----@param current_id string|nil
----@param clients table  already-fetched list (may be empty)
----@param done function
 local function pick_client(org_id, current_id, clients, done)
 	local items = { { id = nil, name = "(no client)" } }
 	for _, c in ipairs(clients) do
 		table.insert(items, c)
 	end
 	table.insert(items, { id = "__new__", name = "+ Create new client…" })
-	vim.ui.select(items, {
+	shell_select(items, {
 		prompt = "Client:",
 		format_item = function(c)
 			return c.name
@@ -474,7 +847,7 @@ local function pick_client(org_id, current_id, clients, done)
 			return
 		end
 		if choice.id == "__new__" then
-			vim.ui.input({ prompt = "New client name: " }, function(name)
+			shell_input("New client name: ", "", function(name)
 				if not name or name:match("^%s*$") then
 					done(current_id)
 					return
@@ -499,7 +872,6 @@ end
 
 local function edit_project(org_id, current_id, project_map, on_done)
 	api.getOrganizationProjects(org_id, function(err, data)
-		-- Refresh project_map in-place
 		for k in pairs(project_map) do
 			project_map[k] = nil
 		end
@@ -519,76 +891,83 @@ local function edit_project(org_id, current_id, project_map, on_done)
 		end
 		table.insert(items, { id = "__clear__", name = "(none)" })
 
-		vim.ui.select(items, {
-			prompt = "Project:",
-			format_item = function(p)
-				return p.name
-			end,
-		}, function(choice)
-			if choice == nil then
-				return
-			end
-			if choice.id == "__keep__" then
-				on_done(current_id)
-			elseif choice.id == "__clear__" then
-				on_done(nil)
-			elseif choice.id == "__new__" then
-				vim.ui.input({ prompt = "Project name: " }, function(name)
-					if not name or name:match("^%s*$") then
-						on_done(current_id)
-						return
-					end
-					name = name:match("^%s*(.-)%s*$")
-					vim.ui.select(PROJECT_COLORS, {
-						prompt = "Color:",
-						format_item = function(c)
-							return c.label
-						end,
-					}, function(color)
-						if not color then
+		vim.schedule(function()
+			shell_select(items, {
+				prompt = "Project:",
+				format_item = function(p)
+					return p.name
+				end,
+			}, function(choice)
+				if choice == nil then
+					return
+				end
+				if choice.id == "__keep__" then
+					on_done(current_id)
+				elseif choice.id == "__clear__" then
+					on_done(nil)
+				elseif choice.id == "__new__" then
+					shell_input("Project name: ", "", function(name)
+						if not name or name:match("^%s*$") then
 							on_done(current_id)
 							return
 						end
-						vim.ui.select({ "No", "Yes" }, { prompt = "Billable by default?" }, function(bill)
-							if not bill then
+						name = name:match("^%s*(.-)%s*$")
+						shell_select(PROJECT_COLORS, {
+							prompt = "Color:",
+							format_item = function(c)
+								return c.label
+							end,
+						}, function(color)
+							if not color then
 								on_done(current_id)
 								return
 							end
-							local billable = bill == "Yes"
-							api.getOrganizationClients(org_id, function(cerr, cdata)
-								local clients = (cdata and cdata.data) or {}
-								pick_client(org_id, nil, clients, function(client_id)
-									api.createProject(org_id, {
-										name = name,
-										color = color.value,
-										billable_by_default = billable,
-										is_billable = billable,
-										client_id = client_id or vim.NIL,
-									}, function(perr, pdata)
-										if perr then
-											vim.notify("Failed to create project: " .. perr, vim.log.levels.ERROR)
-											on_done(current_id)
-										elseif pdata and pdata.data then
-											cache.invalidate_cache("organizations/" .. org_id .. "/projects")
-											project_map[pdata.data.id] = name
-											vim.notify("Project created: " .. name, vim.log.levels.INFO)
-											on_done(pdata.data.id)
-										end
+							shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+								prompt = "Billable by default?",
+								format_item = function(c)
+									return c.name
+								end,
+							}, function(bill)
+								if not bill then
+									on_done(current_id)
+									return
+								end
+								local billable = bill.id == true
+								api.getOrganizationClients(org_id, function(cerr, cdata)
+									local clients = (cdata and cdata.data) or {}
+									pick_client(org_id, nil, clients, function(client_id)
+										api.createProject(org_id, {
+											name = name,
+											color = color.value,
+											billable_by_default = billable,
+											is_billable = billable,
+											client_id = client_id or vim.NIL,
+										}, function(perr, pdata)
+											if perr then
+												vim.notify("Failed to create project: " .. perr, vim.log.levels.ERROR)
+												on_done(current_id)
+											elseif pdata and pdata.data then
+												cache.invalidate_cache("organizations/" .. org_id .. "/projects")
+												project_map[pdata.data.id] = name
+												vim.notify("Project created: " .. name, vim.log.levels.INFO)
+												on_done(pdata.data.id)
+											end
+										end)
 									end)
 								end)
 							end)
 						end)
 					end)
-				end)
-			else
-				on_done(choice.id)
-			end
+				else
+					on_done(choice.id)
+				end
+			end)
 		end)
 	end)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Org / project / tag selectors (used from M.open() and standalone)
+-- Org / project / tag selectors (used from open and standalone)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 function M.selectActiveOrganization(callback)
@@ -636,32 +1015,32 @@ function M.selectActiveProject()
 		end
 		table.insert(items, { id = "__clear__", name = "(none)" })
 
-		vim.ui.select(items, {
-			prompt = "Select a project",
-			format_item = function(line)
-				return line.name
-			end,
-		}, function(selected)
-			if not selected then
-				return
-			end
-			if selected.id == "__new__" then
-				M.createProject(function(new_project)
-					if new_project then
-						tracker.selectActiveProject(new_project.id)
-					end
-				end)
-			elseif selected.id == "__clear__" then
-				tracker.selectActiveProject(nil)
-			else
-				tracker.selectActiveProject(selected.id)
-			end
+		vim.schedule(function()
+			shell_select(items, {
+				prompt = "Select a project",
+				format_item = function(line)
+					return line.name
+				end,
+			}, function(selected)
+				if not selected then
+					return
+				end
+				if selected.id == "__new__" then
+					M.createProject(function(new_project)
+						if new_project then
+							tracker.selectActiveProject(new_project.id)
+						end
+					end)
+				elseif selected.id == "__clear__" then
+					tracker.selectActiveProject(nil)
+				else
+					tracker.selectActiveProject(selected.id)
+				end
+			end)
 		end)
 	end)
 end
 
---- Standalone tag selector (used from :SolidTime tags and as a form field editor).
----@param callback function|nil  called when done
 function M.selectActiveTags(callback)
 	if not tracker.storage.current_information then
 		tracker.storage.current_information = {}
@@ -674,7 +1053,6 @@ function M.selectActiveTags(callback)
 		end
 		return
 	end
-
 	edit_tags(org_id, tracker.storage.current_information.tags, function(ids)
 		tracker.selectActiveTags(ids)
 		if callback then
@@ -683,8 +1061,6 @@ function M.selectActiveTags(callback)
 	end)
 end
 
---- Create project UI (also callable standalone).
----@param callback function|nil  called with project data on success
 function M.createProject(callback)
 	if not tracker.storage.current_information then
 		vim.notify("No organization selected.", vim.log.levels.WARN)
@@ -696,13 +1072,11 @@ function M.createProject(callback)
 		return
 	end
 
-	vim.ui.input({ prompt = "Project name: " }, function(name)
-		if not name or name:match("^%s*$") then
+	shell_input("Project name:", "", function(name)
+		if not name then
 			return
 		end
-		name = name:match("^%s*(.-)%s*$")
-
-		vim.ui.select(PROJECT_COLORS, {
+		shell_select(PROJECT_COLORS, {
 			prompt = "Project color:",
 			format_item = function(c)
 				return c.label
@@ -711,30 +1085,39 @@ function M.createProject(callback)
 			if not color_choice then
 				return
 			end
-			vim.ui.select({ "No", "Yes" }, { prompt = "Billable by default?" }, function(billable_choice)
+			shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+				prompt = "Billable by default?",
+				format_item = function(x)
+					return x.name
+				end,
+			}, function(billable_choice)
 				if not billable_choice then
 					return
 				end
-				local billable = billable_choice == "Yes"
+				local billable = billable_choice.id
 				api.getOrganizationClients(org_id, function(cerr, cdata)
 					local clients = (cdata and cdata.data) or {}
-					pick_client(org_id, nil, clients, function(client_id)
-						api.createProject(org_id, {
-							name = name,
-							color = color_choice.value,
-							billable_by_default = billable,
-							is_billable = billable,
-							client_id = client_id or vim.NIL,
-						}, function(perr, pdata)
-							if perr then
-								vim.notify("Failed to create project: " .. perr, vim.log.levels.ERROR)
-								return
-							end
-							cache.invalidate_cache("organizations/" .. org_id .. "/projects")
-							vim.notify("Project created: " .. name, vim.log.levels.INFO)
-							if callback then
-								callback(pdata and pdata.data)
-							end
+					vim.schedule(function()
+						pick_client(org_id, nil, clients, function(client_id)
+							api.createProject(org_id, {
+								name = name,
+								color = color_choice.value,
+								billable_by_default = billable,
+								is_billable = billable,
+								client_id = client_id or vim.NIL,
+							}, function(perr, pdata)
+								vim.schedule(function()
+									if perr then
+										vim.notify("Failed to create project: " .. perr, vim.log.levels.ERROR)
+										return
+									end
+									cache.invalidate_cache("organizations/" .. org_id .. "/projects")
+									vim.notify("Project created: " .. name, vim.log.levels.INFO)
+									if callback then
+										callback(pdata and pdata.data)
+									end
+								end)
+							end)
 						end)
 					end)
 				end)
@@ -743,23 +1126,14 @@ function M.createProject(callback)
 	end)
 end
 
----@param org_id      string
----@param initial     table   {description, billable, project_id, task_id, tags}
----@param fields_ref  table   pre-declared empty table; will be populated in-place
----@param project_map table   id→name map (pre-fetched, mutated in-place by edit_project)
----@param task_map    table   id→name map (pre-fetched, mutated in-place by edit_task)
----@param tag_map     table   id→name map (pre-fetched)
----@return table  the same table that was passed as fields_ref
 local function make_time_entry_fields(org_id, initial, fields_ref, project_map, task_map, tag_map)
 	fields_ref[1] = {
 		key = "description",
 		label = "Description",
 		value = initial.description,
+		inline_edit = true,
 		display = function(v)
 			return v or "(none)"
-		end,
-		edit = function(v, done)
-			edit_description(v, done)
 		end,
 	}
 	fields_ref[2] = {
@@ -782,14 +1156,12 @@ local function make_time_entry_fields(org_id, initial, fields_ref, project_map, 
 		end,
 		edit = function(v, done)
 			edit_project(org_id, v, project_map, function(new_pid)
-				-- clear task when project changes
 				if new_pid ~= v then
 					for _, f in ipairs(fields_ref) do
 						if f.key == "task" then
 							f.value = nil
 						end
 					end
-					-- also clear task_map since it was for the old project
 					for k in pairs(task_map) do
 						task_map[k] = nil
 					end
@@ -824,14 +1196,20 @@ local function make_time_entry_fields(org_id, initial, fields_ref, project_map, 
 			return display_tags(tag_map, v)
 		end,
 		edit = function(v, done)
-			edit_tags(org_id, v, done)
+			edit_tags(org_id, v, function(ids, refreshed)
+				if refreshed then
+					for k, name in pairs(refreshed) do
+						tag_map[k] = name
+					end
+				end
+				done(ids)
+			end)
 		end,
 	}
 	return fields_ref
 end
 
---- Start screen — form with description / billable / project / tags, then Start.
-function M.startScreen()
+local function timer_tab_open_start_form()
 	local ci = tracker.storage.current_information or {}
 	local org_id = ci.organization_id
 
@@ -846,9 +1224,9 @@ function M.startScreen()
 	local fetched_projects = 0
 	local fetched_tags = 0
 	local fetched_tasks = 0
-	local need_tasks = ci.project_id and ci.task_id and 1 or 0
+	local need_tasks = (ci.project_id and ci.task_id) and 1 or 0
 
-	local function open_start_form()
+	local function open_form_now()
 		local fields = {}
 		make_time_entry_fields(org_id, {
 			description = ci.description,
@@ -862,7 +1240,6 @@ function M.startScreen()
 
 		open_form(fields, "Start Time Entry", function(f)
 			local vals = fields_to_vals(f)
-
 			if not tracker.storage.current_information then
 				tracker.storage.current_information = {}
 			end
@@ -871,9 +1248,7 @@ function M.startScreen()
 			tracker.storage.current_information.project_id = vals.project
 			tracker.storage.current_information.task_id = vals.task
 			tracker.selectActiveTags(vals.tags)
-
 			tracker.start()
-
 			autotrack.save_project_state(autotrack.detect_project(), {
 				task_id = vals.task,
 				description = vals.description,
@@ -885,7 +1260,7 @@ function M.startScreen()
 
 	local function maybe_open()
 		if fetched_projects == 1 and fetched_tags == 1 and fetched_tasks == need_tasks then
-			open_start_form()
+			open_form_now()
 		end
 	end
 
@@ -922,62 +1297,7 @@ function M.startScreen()
 	end)
 end
 
---- Internal: commit edits to an active entry (API + local storage).
----@param entry table
----@param org_id string
----@param description string|nil
----@param billable boolean
----@param tags string[]|nil
----@param project_id string|nil
----@param task_id string|nil
-local function finalize_edit(entry, org_id, description, billable, tags, project_id, task_id)
-	entry.description = description
-	entry.billable = billable
-	entry.tags = tags
-	entry.project_id = project_id
-	entry.task_id = task_id
-	tracker.storage.active_entry = entry
-
-	if tracker.storage.current_information then
-		tracker.storage.current_information.description = description
-		tracker.storage.current_information.billable = billable
-		tracker.storage.current_information.tags = tags
-		tracker.storage.current_information.project_id = project_id
-		tracker.storage.current_information.task_id = task_id
-	end
-
-	autotrack.save_project_state(autotrack.detect_project(), {
-		task_id = task_id,
-		description = description,
-		billable = billable,
-		tags = tags,
-	})
-
-	if entry.id then
-		api.updateTimeEntry(org_id, entry.id, {
-			member_id = entry.member_id,
-			project_id = project_id,
-			task_id = task_id,
-			start = entry.start,
-			billable = billable,
-			description = description,
-			tags = tags,
-		}, function(err, _)
-			if err then
-				vim.notify("Failed to update entry: " .. err, vim.log.levels.ERROR)
-				return
-			end
-			vim.notify("Time entry updated.", vim.log.levels.INFO)
-		end)
-	else
-		vim.notify("Time entry updated.", vim.log.levels.INFO)
-	end
-
-	tracker.selectActiveTags(tags)
-end
-
---- Edit active entry — form pre-filled from active entry; confirm pushes update.
-function M.editActiveEntry()
+local function timer_tab_open_edit_form()
 	local entry = tracker.storage.active_entry
 	if not entry then
 		vim.notify("No active time entry to edit.", vim.log.levels.WARN)
@@ -998,9 +1318,55 @@ function M.editActiveEntry()
 	local fetched_projects = 0
 	local fetched_tags = 0
 	local fetched_tasks = 0
-	local need_tasks = entry.project_id and entry.task_id and 1 or 0
+	local need_tasks = (entry.project_id and entry.task_id) and 1 or 0
 
-	local function open_edit_form()
+	local function finalize_edit(description, billable, tags, project_id, task_id)
+		entry.description = description
+		entry.billable = billable
+		entry.tags = tags
+		entry.project_id = project_id
+		entry.task_id = task_id
+		tracker.storage.active_entry = entry
+
+		if tracker.storage.current_information then
+			tracker.storage.current_information.description = description
+			tracker.storage.current_information.billable = billable
+			tracker.storage.current_information.tags = tags
+			tracker.storage.current_information.project_id = project_id
+			tracker.storage.current_information.task_id = task_id
+		end
+
+		autotrack.save_project_state(autotrack.detect_project(), {
+			task_id = task_id,
+			description = description,
+			billable = billable,
+			tags = tags,
+		})
+
+		if entry.id then
+			api.updateTimeEntry(org_id, entry.id, {
+				member_id = entry.member_id,
+				project_id = project_id,
+				task_id = task_id,
+				start = entry.start,
+				billable = billable,
+				description = description,
+				tags = tags,
+			}, function(err, _)
+				if err then
+					vim.notify("Failed to update entry: " .. err, vim.log.levels.ERROR)
+					return
+				end
+				vim.notify("Time entry updated.", vim.log.levels.INFO)
+			end)
+		else
+			vim.notify("Time entry updated.", vim.log.levels.INFO)
+		end
+
+		tracker.selectActiveTags(tags)
+	end
+
+	local function open_form_now()
 		local fields = {}
 		make_time_entry_fields(org_id, {
 			description = entry.description,
@@ -1014,14 +1380,13 @@ function M.editActiveEntry()
 
 		open_form(fields, "Edit Time Entry", function(f)
 			local vals = fields_to_vals(f)
-
-			finalize_edit(entry, org_id, vals.description, vals.billable, vals.tags, vals.project, vals.task)
+			finalize_edit(vals.description, vals.billable, vals.tags, vals.project, vals.task)
 		end)
 	end
 
 	local function maybe_open()
 		if fetched_projects == 1 and fetched_tags == 1 and fetched_tasks == need_tasks then
-			open_edit_form()
+			open_form_now()
 		end
 	end
 
@@ -1058,61 +1423,386 @@ function M.editActiveEntry()
 	end)
 end
 
---- Build and open the project list floating window.
---- j/k to navigate, <CR> to edit, a to add, d to delete, q/<Esc> to close.
-function M.projectsScreen()
-	local autotrack = require("solidtime.autotrack")
+function M._tab_timer()
+	local entry = tracker.storage.active_entry
 
-	-- ── helpers ──────────────────────────────────────────────────────────────
+	if not entry then
+		local function render(inner_w)
+			local lines = {}
+			local lbl = string.format("  %-14s│ ", "Status")
+			table.insert(lines, string.rep("─", inner_w))
+			table.insert(lines, lbl .. "○ Stopped")
+			table.insert(lines, string.rep("─", inner_w))
+			table.insert(lines, "")
+			table.insert(lines, "  s start   1-6 switch tab   q close")
+			return lines
+		end
+		local function install_keymaps()
+			if not shell_is_open() then
+				return
+			end
+			local buf = shell.buf
+			bmap(buf, km().nav_down, function() end, "—")
+			bmap(buf, km().nav_up, function() end, "—")
+			bmap(buf, km().confirm, function() end, "—")
+			vim.keymap.set("n", "s", function()
+				timer_tab_open_start_form()
+			end, { buffer = buf, nowait = true, desc = "Start timer" })
+		end
+		shell_push({ render = render, install_keymaps = install_keymaps })
+		return
+	end
 
-	local LIST_WIDTH = 72
-	local LIST_HEIGHT = 20
+	local org_id = entry.organization_id
+		or (tracker.storage.current_information and tracker.storage.current_information.organization_id)
+
+	if not org_id then
+		vim.notify("Cannot determine organization for active entry.", vim.log.levels.ERROR)
+		return
+	end
+
+	local project_map = {}
+	local task_map = {}
+	local tag_map = {}
+	local fetched_projects = 0
+	local fetched_tags = 0
+	local fetched_tasks = 0
+	local need_tasks = (entry.project_id and entry.task_id) and 1 or 0
+
+	local function parse_iso(s)
+		if type(s) ~= "string" then
+			return nil
+		end
+		local y, mo, d, h, mi, sec = s:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+		if not y then
+			return nil
+		end
+		y, mo, d, h, mi, sec = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi), tonumber(sec)
+		local now = os.time()
+		local tz_offset = os.difftime(now, os.time(os.date("!*t", now)))
+		return os.time({ year = y, month = mo, day = d, hour = h, min = mi, sec = sec }) + tz_offset
+	end
+
+	local function elapsed_str()
+		local t1 = entry.start and parse_iso(entry.start)
+		if not t1 then
+			return "running"
+		end
+		local secs = math.max(0, os.time() - t1)
+		local h = math.floor(secs / 3600)
+		local m = math.floor((secs % 3600) / 60)
+		if h > 0 then
+			return string.format("● Running  %dh %02dm", h, m)
+		end
+		return string.format("● Running  %dm", m)
+	end
+
+	local function finalize_edit(description, billable, tags, project_id, task_id)
+		entry.description = description
+		entry.billable = billable
+		entry.tags = tags
+		entry.project_id = project_id
+		entry.task_id = task_id
+		tracker.storage.active_entry = entry
+
+		if tracker.storage.current_information then
+			tracker.storage.current_information.description = description
+			tracker.storage.current_information.billable = billable
+			tracker.storage.current_information.tags = tags
+			tracker.storage.current_information.project_id = project_id
+			tracker.storage.current_information.task_id = task_id
+		end
+
+		autotrack.save_project_state(autotrack.detect_project(), {
+			task_id = task_id,
+			description = description,
+			billable = billable,
+			tags = tags,
+		})
+
+		if entry.id then
+			api.updateTimeEntry(org_id, entry.id, {
+				member_id = entry.member_id,
+				project_id = project_id,
+				task_id = task_id,
+				start = entry.start,
+				billable = billable,
+				description = description,
+				tags = tags,
+			}, function(err, _)
+				if err then
+					vim.notify("Failed to update entry: " .. err, vim.log.levels.ERROR)
+					return
+				end
+				vim.notify("Time entry updated.", vim.log.levels.INFO)
+			end)
+		else
+			vim.notify("Time entry updated.", vim.log.levels.INFO)
+		end
+
+		tracker.selectActiveTags(tags)
+	end
+
+	local function open_form_now()
+		if #shell.stack > 0 then
+			table.remove(shell.stack)
+		end
+
+		local entry_fields = {}
+		make_time_entry_fields(org_id, {
+			description = entry.description,
+			billable = entry.billable,
+			project_id = entry.project_id,
+			task_id = entry.task_id,
+			tags = entry.tags,
+		}, entry_fields, project_map, task_map, tag_map)
+
+		local fields = {
+			{
+				key = "status",
+				label = "Status",
+				value = true,
+				display = function(_)
+					return elapsed_str()
+				end,
+			},
+		}
+		for _, f in ipairs(entry_fields) do
+			table.insert(fields, f)
+		end
+		table.insert(fields, { key = "__sep__", label = "" })
+		table.insert(fields, { key = "__action__", label = "✎  Save" })
+
+		open_form(fields, "Timer", function(f)
+			local vals = fields_to_vals(f)
+			finalize_edit(vals.description, vals.billable, vals.tags, vals.project, vals.task)
+			shell.stack = {}
+			M._tab_timer()
+		end)
+
+		vim.schedule(function()
+			if not shell_is_open() then
+				return
+			end
+			vim.keymap.set("n", "s", function()
+				tracker.stop()
+				shell.stack = {}
+				M._tab_timer()
+			end, { buffer = shell.buf, nowait = true, desc = "Stop timer" })
+		end)
+	end
+
+	local function maybe_open()
+		if fetched_projects == 1 and fetched_tags == 1 and fetched_tasks == need_tasks then
+			open_form_now()
+		end
+	end
+
+	shell_push({
+		render = function(inner_w)
+			return { string.rep("─", inner_w), "  Loading…" }
+		end,
+	})
+
+	api.getOrganizationProjects(org_id, function(err, data)
+		if not err and data and data.data then
+			for _, p in ipairs(data.data) do
+				project_map[p.id] = p.name
+			end
+		end
+		fetched_projects = 1
+		vim.schedule(maybe_open)
+	end)
+
+	if need_tasks == 1 then
+		api.getOrganizationTasks(org_id, { project_id = entry.project_id, done = "false" }, function(err, data)
+			if not err and data and data.data then
+				for _, t in ipairs(data.data) do
+					task_map[t.id] = t.name
+				end
+			end
+			fetched_tasks = 1
+			vim.schedule(maybe_open)
+		end)
+	end
+
+	api.getOrganizationTags(org_id, function(err, data)
+		if not err and data and data.data then
+			for _, t in ipairs(data.data) do
+				tag_map[t.id] = t.name
+			end
+		end
+		fetched_tags = 1
+		vim.schedule(maybe_open)
+	end)
+end
+
+function M._tab_status()
+	local auth_mod = require("solidtime.auth")
+	local memberships_data = nil
+	local projects_data = nil
+
+	local function open_status_form()
+		if #shell.stack > 0 then
+			table.remove(shell.stack)
+		end
+
+		local function auth_display(_)
+			local cfg = config.get()
+			local url = cfg.api_url or "(no URL)"
+			local key = cfg.api_key
+			local masked = key and (string.rep("*", math.min(math.max(0, #key - 4), 12)) .. key:sub(-4)) or "(no key)"
+			return url .. "  " .. masked
+		end
+
+		local function org_display(_)
+			local ci = tracker.storage.current_information
+			if not ci or not ci.organization_id then
+				return "(none)"
+			end
+			if memberships_data then
+				for _, m in ipairs(memberships_data) do
+					if m.organization and m.organization.id == ci.organization_id then
+						return m.organization.name
+					end
+				end
+			end
+			return ci.organization_id
+		end
+
+		local function project_display(_)
+			local ci = tracker.storage.current_information
+			if not ci or not ci.project_id then
+				return "(none)"
+			end
+			if projects_data then
+				for _, p in ipairs(projects_data) do
+					if p.id == ci.project_id then
+						return p.name
+					end
+				end
+			end
+			return ci.project_id
+		end
+
+		local fields = {
+			{
+				key = "auth",
+				label = "Auth",
+				value = true,
+				display = auth_display,
+				edit = function(_, on_done)
+					auth_mod.prompt_api_key()
+					vim.schedule(function()
+						on_done(true)
+					end)
+				end,
+			},
+			{
+				key = "org",
+				label = "Organization",
+				value = (tracker.storage.current_information or {}).organization_id,
+				display = org_display,
+				edit = function(_, on_done)
+					M.selectActiveOrganization(function()
+						api.getUserMemberships(function(err, data)
+							if not err and data and data.data then
+								memberships_data = data.data
+							end
+							local ci = tracker.storage.current_information
+							on_done(ci and ci.organization_id)
+						end)
+					end)
+				end,
+			},
+			{
+				key = "project",
+				label = "Project",
+				value = (tracker.storage.current_information or {}).project_id,
+				display = project_display,
+				edit = function(_, on_done)
+					M.selectActiveProject()
+					local ci = tracker.storage.current_information
+					local oid = ci and ci.organization_id
+					if oid then
+						api.getOrganizationProjects(oid, function(err, data)
+							if not err and data and data.data then
+								projects_data = data.data
+							end
+							local ci2 = tracker.storage.current_information
+							on_done(ci2 and ci2.project_id)
+						end)
+					else
+						vim.schedule(function()
+							local ci2 = tracker.storage.current_information
+							on_done(ci2 and ci2.project_id)
+						end)
+					end
+				end,
+			},
+			{ key = "__sep__", label = "" },
+			{ key = "__action__", label = "Close" },
+		}
+
+		open_form(fields, "SolidTime Status", function(_)
+			shell_close()
+		end)
+	end
+
+	local fetched_memberships = 0
+	local fetched_projects = 0
+
+	local function maybe_open()
+		if fetched_memberships == 1 and fetched_projects == 1 then
+			open_status_form()
+		end
+	end
+
+	local ci = tracker.storage.current_information
+
+	api.getUserMemberships(function(err, data)
+		if not err and data and data.data then
+			memberships_data = data.data
+		end
+		fetched_memberships = 1
+		maybe_open()
+	end)
+
+	local org_id = ci and ci.organization_id
+	if org_id then
+		api.getOrganizationProjects(org_id, function(err, data)
+			if not err and data and data.data then
+				projects_data = data.data
+			end
+			fetched_projects = 1
+			maybe_open()
+		end)
+	else
+		fetched_projects = 1
+		maybe_open()
+	end
+
+	shell_push({
+		render = function(inner_w)
+			return { string.rep("─", inner_w), "  Loading…" }
+		end,
+	})
+end
+
+function M._tab_projects()
+	local autotrack_mod = require("solidtime.autotrack")
+	local org_id = tracker.storage.current_information and tracker.storage.current_information.organization_id
 
 	local COL_LOCAL = 18
 	local COL_PROJ = 22
 	local COL_AUTO = 8
 
-	local function make_header()
-		return "  "
-			.. pad("Local name", COL_LOCAL)
-			.. "│ "
-			.. pad("Solidtime project", COL_PROJ)
-			.. "│ "
-			.. pad("Auto", COL_AUTO)
-			.. "│ Description"
-	end
-
-	local function make_separator()
-		return string.rep("─", LIST_WIDTH)
-	end
-
-	local row = math.floor((vim.o.lines - LIST_HEIGHT) / 2)
-	local col = math.floor((vim.o.columns - LIST_WIDTH - 2) / 2)
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = LIST_WIDTH,
-		height = LIST_HEIGHT,
-		row = row,
-		col = col,
-		style = "minimal",
-		border = "rounded",
-		title = " Projects ",
-		title_pos = "center",
-	})
-
-	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("cursorline", true, { win = win })
-
-	local org_id = tracker.storage.current_information and tracker.storage.current_information.organization_id
-
 	local all_org_projects = nil
-
 	local rows = {}
+	local search_query = ""
+	local searching = false
 
-	local function redraw()
+	local function make_rows()
 		local proj_id_to_name = {}
 		if all_org_projects then
 			for _, p in ipairs(all_org_projects) do
@@ -1120,29 +1810,64 @@ function M.projectsScreen()
 			end
 		end
 
-		local projects = autotrack.read_config()
+		local projects = autotrack_mod.read_config()
 		rows = {}
 		local names = vim.tbl_keys(projects)
 		table.sort(names)
+		local q = search_query ~= "" and search_query:lower() or nil
 		for _, name in ipairs(names) do
-			local cfg = projects[name]
-			local proj_name = proj_id_to_name[cfg.solidtime_project_id] or cfg.solidtime_project_id or "(none)"
-			local auto_str = cfg.auto_start and "yes" or "no"
-			local desc_str = cfg.default_description or ""
-			local line = "  "
-				.. pad(name, COL_LOCAL)
-				.. "│ "
-				.. pad(proj_name, COL_PROJ)
-				.. "│ "
-				.. pad(auto_str, COL_AUTO)
-				.. "│ "
-				.. desc_str
-			table.insert(rows, { line = line, key = name })
+			if not q or name:lower():find(q, 1, true) then
+				local cfg = projects[name]
+				local proj_name = proj_id_to_name[cfg.solidtime_project_id] or cfg.solidtime_project_id or "(none)"
+				local auto_str = cfg.auto_start and "yes" or "no"
+				local desc_str = cfg.default_description or ""
+				local line = "  "
+					.. pad(name, COL_LOCAL)
+					.. "│ "
+					.. pad(proj_name, COL_PROJ)
+					.. "│ "
+					.. pad(auto_str, COL_AUTO)
+					.. "│ "
+					.. desc_str
+				table.insert(rows, { line = line, key = name })
+			end
 		end
+	end
 
-		local lines = { make_header(), make_separator() }
+	local function render(inner_w)
+		make_rows()
+		local title_line
+		if searching then
+			title_line = "  Projects  /  " .. search_query .. "█"
+		elseif search_query ~= "" then
+			title_line = "  Projects  [/" .. search_query .. "]"
+		else
+			title_line = "  Local name"
+				.. string.rep(" ", math.max(1, COL_LOCAL - 10))
+				.. "│ "
+				.. pad("Solidtime project", COL_PROJ)
+				.. "│ "
+				.. pad("Auto", COL_AUTO)
+				.. "│ Description"
+		end
+		local header = searching and title_line
+			or (
+				"  "
+				.. pad("Local name", COL_LOCAL)
+				.. "│ "
+				.. pad("Solidtime project", COL_PROJ)
+				.. "│ "
+				.. pad("Auto", COL_AUTO)
+				.. "│ Description"
+			)
+		if searching or search_query ~= "" then
+			header = title_line
+		end
+		local lines = { header, string.rep("─", inner_w) }
 		if all_org_projects == nil then
 			table.insert(lines, "  Loading…")
+		elseif #rows == 0 and search_query ~= "" then
+			table.insert(lines, "  (no matches)")
 		elseif #rows == 0 then
 			table.insert(lines, "  (no projects registered — press 'a' to add one)")
 		else
@@ -1150,52 +1875,19 @@ function M.projectsScreen()
 				table.insert(lines, r.line)
 			end
 		end
-		table.insert(lines, make_separator())
-		table.insert(lines, "  a add  d delete  <CR> edit  t tasks  q close")
-
-		if vim.api.nvim_buf_is_valid(buf) then
-			list_set_lines(buf, lines)
+		table.insert(lines, string.rep("─", inner_w))
+		if searching then
+			table.insert(lines, "  typing… <CR> confirm   <Esc> cancel")
+		elseif search_query ~= "" then
+			table.insert(lines, "  / search   <Esc> clear   a add  d delete  <CR> edit  t tasks  q close")
+		else
+			table.insert(lines, "  / search   a add  d delete  <CR> edit  t tasks  q close")
 		end
+		return lines
 	end
 
-	redraw()
-
-	local function set_cursor_row(idx)
-		list_set_cursor(win, idx)
-	end
-	local function current_row_idx()
-		return list_current_idx(win, rows)
-	end
-	local function close()
-		list_close(win)
-	end
-
-	if org_id then
-		api.getOrganizationProjects(org_id, function(err, data)
-			vim.schedule(function()
-				if not vim.api.nvim_buf_is_valid(buf) then
-					return
-				end
-				if err or not data or not data.data then
-					all_org_projects = {}
-					vim.notify("Could not load projects: " .. tostring(err or "unknown"), vim.log.levels.WARN)
-				else
-					all_org_projects = data.data
-				end
-				redraw()
-				if #rows > 0 then
-					set_cursor_row(1)
-				end
-			end)
-		end)
-	else
-		all_org_projects = {}
-		redraw()
-	end
-
-	---@param local_name string|nil  nil = new entry
 	local function open_project_form(local_name)
-		local projects = autotrack.read_config()
+		local projects = autotrack_mod.read_config()
 		local existing = (local_name and projects[local_name]) or {}
 		local is_new = local_name == nil
 
@@ -1206,7 +1898,6 @@ function M.projectsScreen()
 
 		local all_projects = all_org_projects or {}
 
-		-- Fetch clients async, then build and open the form
 		api.getOrganizationClients(org_id, function(cerr, cdata)
 			local all_clients = (not cerr and cdata and cdata.data) or {}
 
@@ -1217,10 +1908,7 @@ function M.projectsScreen()
 				for _, p in ipairs(all_projects) do
 					if p.id == pid then
 						local cid = p.client_id
-						if cid == vim.NIL then
-							return nil
-						end
-						return cid
+						return (cid == vim.NIL) and nil or cid
 					end
 				end
 				return nil
@@ -1228,22 +1916,15 @@ function M.projectsScreen()
 
 			local local_name_field
 			if is_new then
-				local detected = autotrack.detect_project() or ""
+				local detected = autotrack_mod.detect_project() or ""
 				local_name_field = {
 					key = "local_name",
 					label = "Local name",
 					value = detected,
 					display = function(v)
-						return v ~= "" and v or "(type to set)"
+						return (v ~= "" and v) or "(type to set)"
 					end,
-					edit = function(v, done)
-						vim.ui.input({ prompt = "Local project name: ", default = v or "" }, function(val)
-							if val == nil then
-								return
-							end
-							done(val:match("^%s*(.-)%s*$"))
-						end)
-					end,
+					inline_edit = true,
 				}
 			else
 				local_name_field = {
@@ -1256,7 +1937,7 @@ function M.projectsScreen()
 				}
 			end
 
-			local function solidtime_project_display(pid)
+			local function st_proj_display(pid)
 				if not pid then
 					return "(none)"
 				end
@@ -1268,13 +1949,13 @@ function M.projectsScreen()
 				return pid
 			end
 
-			local function solidtime_project_edit(pid, done)
+			local function st_proj_edit(pid, done)
 				local items = {}
 				for _, p in ipairs(all_projects) do
 					table.insert(items, p)
 				end
 				table.insert(items, { id = "__new__", name = "+ Create new project…" })
-				vim.ui.select(items, {
+				shell_select(items, {
 					prompt = "Solidtime project:",
 					format_item = function(p)
 						return p.name
@@ -1285,42 +1966,46 @@ function M.projectsScreen()
 						return
 					end
 					if choice.id == "__new__" then
-						vim.ui.input({ prompt = "Project name: " }, function(name)
+						shell_input("Project name: ", "", function(name)
 							if not name or name:match("^%s*$") then
 								done(pid)
 								return
 							end
 							name = name:match("^%s*(.-)%s*$")
-							vim.ui.select(PROJECT_COLORS, {
-								prompt = "Color:",
-								format_item = function(c)
-									return c.label
-								end,
-							}, function(color)
-								if not color then
-									done(pid)
-									return
-								end
-								pick_client(org_id, nil, all_clients, function(new_client_id)
-									api.createProject(org_id, {
-										name = name,
-										color = color.value,
-										billable_by_default = false,
-										is_billable = false,
-										client_id = new_client_id or vim.NIL,
-									}, function(perr, pdata)
-										if perr or not pdata or not pdata.data then
-											vim.notify(
-												"Failed to create project: " .. (perr or "?"),
-												vim.log.levels.ERROR
-											)
-											done(pid)
-										else
-											cache.invalidate_cache("organizations/" .. org_id .. "/projects")
-											table.insert(all_projects, pdata.data)
-											vim.notify("Project created: " .. name, vim.log.levels.INFO)
-											done(pdata.data.id)
-										end
+							vim.schedule(function()
+								shell_select(PROJECT_COLORS, {
+									prompt = "Color:",
+									format_item = function(c)
+										return c.label
+									end,
+								}, function(color)
+									if not color then
+										done(pid)
+										return
+									end
+									pick_client(org_id, nil, all_clients, function(new_client_id)
+										api.createProject(org_id, {
+											name = name,
+											color = color.value,
+											billable_by_default = false,
+											is_billable = false,
+											client_id = new_client_id or vim.NIL,
+										}, function(perr, pdata)
+											vim.schedule(function()
+												if perr or not pdata or not pdata.data then
+													vim.notify(
+														"Failed to create project: " .. (perr or "?"),
+														vim.log.levels.ERROR
+													)
+													done(pid)
+												else
+													cache.invalidate_cache("organizations/" .. org_id .. "/projects")
+													table.insert(all_projects, pdata.data)
+													vim.notify("Project created: " .. name, vim.log.levels.INFO)
+													done(pdata.data.id)
+												end
+											end)
+										end)
 									end)
 								end)
 							end)
@@ -1343,25 +2028,23 @@ function M.projectsScreen()
 				return "(unknown client)"
 			end
 
-			local function client_edit(cid, done)
-				pick_client(org_id, cid, all_clients, done)
-			end
-
-			local fields = {
+			local form_fields = {
 				local_name_field,
 				{
 					key = "solidtime_project_id",
 					label = "ST project",
 					value = existing.solidtime_project_id,
-					display = solidtime_project_display,
-					edit = solidtime_project_edit,
+					display = st_proj_display,
+					edit = st_proj_edit,
 				},
 				{
 					key = "client_id",
 					label = "Client",
 					value = get_project_client_id(existing.solidtime_project_id),
 					display = client_display,
-					edit = client_edit,
+					edit = function(cid, done)
+						pick_client(org_id, cid, all_clients, done)
+					end,
 				},
 				{
 					key = "auto_start",
@@ -1371,11 +2054,16 @@ function M.projectsScreen()
 						return v and "Yes" or "No"
 					end,
 					edit = function(_, done)
-						vim.ui.select({ "No", "Yes" }, { prompt = "Auto-start?" }, function(c)
+						shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+							prompt = "Auto-start?",
+							format_item = function(x)
+								return x.name
+							end,
+						}, function(c)
 							if c == nil then
 								return
 							end
-							done(c == "Yes")
+							done(c.id)
 						end)
 					end,
 				},
@@ -1386,14 +2074,7 @@ function M.projectsScreen()
 					display = function(v)
 						return (v and v ~= "") and v or "(none)"
 					end,
-					edit = function(v, done)
-						vim.ui.input({ prompt = "Default description: ", default = v or "" }, function(val)
-							if val == nil then
-								return
-							end
-							done(val:match("^%s*(.-)%s*$"))
-						end)
-					end,
+					inline_edit = true,
 				},
 				{
 					key = "default_billable",
@@ -1403,11 +2084,16 @@ function M.projectsScreen()
 						return v and "Yes" or "No"
 					end,
 					edit = function(_, done)
-						vim.ui.select({ "No", "Yes" }, { prompt = "Default billable?" }, function(c)
+						shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+							prompt = "Default billable?",
+							format_item = function(x)
+								return x.name
+							end,
+						}, function(c)
 							if c == nil then
 								return
 							end
-							done(c == "Yes")
+							done(c.id)
 						end)
 					end,
 				},
@@ -1417,9 +2103,8 @@ function M.projectsScreen()
 
 			local form_title = is_new and "Add Project" or ("Edit: " .. local_name)
 
-			open_form(fields, form_title, function(f)
+			open_form(form_fields, form_title, function(f)
 				local vals = fields_to_vals(f)
-
 				local key = vals.local_name
 				if not key or key == "" then
 					vim.notify("Local project name cannot be empty.", vim.log.levels.ERROR)
@@ -1427,7 +2112,7 @@ function M.projectsScreen()
 				end
 
 				local function finish_save()
-					local updated = autotrack.read_config()
+					local updated = autotrack_mod.read_config()
 					updated[key] = {
 						solidtime_project_id = vals.solidtime_project_id,
 						auto_start = vals.auto_start or false,
@@ -1442,14 +2127,10 @@ function M.projectsScreen()
 						member_id = existing.member_id
 							or (tracker.storage.current_information and tracker.storage.current_information.member_id),
 					}
-					autotrack.write_config(updated)
+					autotrack_mod.write_config(updated)
 					vim.notify("Saved project '" .. key .. "'.", vim.log.levels.INFO)
-
 					vim.schedule(function()
-						if vim.api.nvim_win_is_valid(win) then
-							vim.api.nvim_set_current_win(win)
-							redraw()
-						end
+						shell_redraw()
 					end)
 				end
 
@@ -1487,319 +2168,414 @@ function M.projectsScreen()
 		end)
 	end
 
-	bmap(buf, km().close, close, "Close")
-	bmap(buf, km().close_alt, close, "Close")
+	local function install_keymaps()
+		if not shell_is_open() then
+			return
+		end
+		local buf = shell.buf
 
-	bmap(buf, km().nav_down, function()
-		if not vim.api.nvim_win_is_valid(win) then
-			return
-		end
-		local idx = current_row_idx()
-		if idx and idx < #rows then
-			set_cursor_row(idx + 1)
-		end
-	end, "Next project")
-
-	bmap(buf, km().nav_up, function()
-		if not vim.api.nvim_win_is_valid(win) then
-			return
-		end
-		local idx = current_row_idx()
-		if idx and idx > 1 then
-			set_cursor_row(idx - 1)
-		end
-	end, "Previous project")
-
-	bmap(buf, km().confirm, function()
-		local idx = current_row_idx()
-		if not idx then
-			return
-		end
-		local row_data = rows[idx]
-		if row_data then
-			open_project_form(row_data.key)
-		end
-	end, "Edit project mapping")
-
-	bmap(buf, km().add, function()
-		open_project_form(nil)
-	end, "Add project mapping")
-
-	bmap(buf, km().tasks, function()
-		local idx = current_row_idx()
-		if not idx then
-			return
-		end
-		local row_data = rows[idx]
-		if not row_data then
-			return
-		end
-		local projects = autotrack.read_config()
-		local cfg = projects[row_data.key]
-		local st_id = cfg and cfg.solidtime_project_id
-		if not st_id then
-			vim.notify("No Solidtime project linked to '" .. row_data.key .. "'.", vim.log.levels.WARN)
-			return
-		end
-		local proj_name = row_data.key
-		if all_org_projects then
-			for _, p in ipairs(all_org_projects) do
-				if p.id == st_id then
-					proj_name = p.name
-					break
-				end
+		bmap(buf, km().nav_down, function()
+			make_rows()
+			local idx = list_current_idx(rows)
+			if idx and idx < #rows then
+				list_set_cursor(idx + 1)
 			end
-		end
-		M.tasksScreen(st_id, proj_name)
-	end, "Open tasks for project")
+		end, "Next project")
 
-	bmap(buf, km().delete, function()
-		local idx = current_row_idx()
-		if not idx then
-			return
-		end
-		local row_data = rows[idx]
-		if not row_data then
-			return
-		end
+		bmap(buf, km().nav_up, function()
+			make_rows()
+			local idx = list_current_idx(rows)
+			if idx and idx > 1 then
+				list_set_cursor(idx - 1)
+			end
+		end, "Previous project")
 
-		vim.ui.select({ "No", "Yes" }, {
-			prompt = "Delete '" .. row_data.key .. "'?",
-		}, function(choice)
-			if choice ~= "Yes" then
+		vim.keymap.set("n", "gg", function()
+			if #rows > 0 then
+				list_set_cursor(1)
+			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			if #rows > 0 then
+				list_set_cursor(#rows)
+			end
+		end, { buffer = buf, nowait = true })
+
+		bmap(buf, km().confirm, function()
+			local idx = list_current_idx(rows)
+			if not idx then
 				return
 			end
-			local projects = autotrack.read_config()
-			projects[row_data.key] = nil
-			autotrack.write_config(projects)
-			vim.notify("Removed '" .. row_data.key .. "'.", vim.log.levels.INFO)
-			vim.schedule(function()
-				if vim.api.nvim_win_is_valid(win) then
-					redraw()
-					local new_idx = math.min(idx, #rows)
-					if new_idx > 0 then
-						set_cursor_row(new_idx)
+			open_project_form(rows[idx].key)
+		end, "Edit project mapping")
+
+		bmap(buf, km().add, function()
+			open_project_form(nil)
+		end, "Add project mapping")
+
+		bmap(buf, km().tasks, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local row_data = rows[idx]
+			if not row_data then
+				return
+			end
+			local projects = autotrack_mod.read_config()
+			local cfg = projects[row_data.key]
+			local st_id = cfg and cfg.solidtime_project_id
+			if not st_id then
+				vim.notify("No Solidtime project linked to '" .. row_data.key .. "'.", vim.log.levels.WARN)
+				return
+			end
+			local proj_name = row_data.key
+			if all_org_projects then
+				for _, p in ipairs(all_org_projects) do
+					if p.id == st_id then
+						proj_name = p.name
+						break
 					end
+				end
+			end
+			shell.active_tab = 5
+			shell_resize_for_tab()
+			shell.stack = {}
+			M._tab_tasks(st_id, proj_name)
+		end, "Open tasks for project")
+
+		bmap(buf, km().delete, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local row_data = rows[idx]
+			if not row_data then
+				return
+			end
+			shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+				prompt = "Delete '" .. row_data.key .. "'?",
+				format_item = function(x)
+					return x.name
+				end,
+			}, function(choice)
+				if not choice or not choice.id then
+					return
+				end
+				local projects = autotrack_mod.read_config()
+				projects[row_data.key] = nil
+				autotrack_mod.write_config(projects)
+				vim.notify("Removed '" .. row_data.key .. "'.", vim.log.levels.INFO)
+				vim.schedule(function()
+					shell_redraw()
+				end)
+			end)
+		end, "Delete project mapping")
+
+		vim.keymap.set("n", "/", function()
+			if not shell_is_open() then
+				return
+			end
+			searching = true
+			shell_redraw()
+			vim.ui.input({ prompt = "/" }, function(input)
+				searching = false
+				if input ~= nil then
+					search_query = input
+				end
+				vim.schedule(function()
+					if shell_is_open() then
+						shell_redraw()
+						if #rows > 0 then
+							list_set_cursor(1)
+						end
+					end
+				end)
+			end)
+		end, { buffer = buf, nowait = true, desc = "Search projects" })
+
+		vim.keymap.set("n", "<Esc>", function()
+			if not shell_is_open() then
+				return
+			end
+			if search_query ~= "" then
+				search_query = ""
+				shell_redraw()
+				if #rows > 0 then
+					list_set_cursor(1)
+				end
+			end
+		end, { buffer = buf, nowait = true, desc = "Clear search" })
+	end
+
+	shell_push({ render = render, install_keymaps = install_keymaps })
+
+	if org_id then
+		cache.invalidate_cache("organizations/" .. org_id .. "/projects")
+		api.getOrganizationProjects(org_id, function(err, data)
+			vim.schedule(function()
+				if not shell_is_open() then
+					return
+				end
+				if err or not data or not data.data then
+					all_org_projects = {}
+					vim.notify("Could not load projects: " .. tostring(err or "unknown"), vim.log.levels.WARN)
+				else
+					all_org_projects = data.data
+				end
+				shell_redraw()
+				if #rows > 0 then
+					list_set_cursor(1)
 				end
 			end)
 		end)
-	end, "Delete project mapping")
-end
-
-function M.statusScreen()
-	local auth = require("solidtime.auth")
-	local config = require("solidtime.config")
-
-	local function auth_display(_)
-		local cfg = config.get()
-		local url = cfg.api_url or "(no URL)"
-		local key = cfg.api_key
-		local masked = key and (string.rep("*", math.min(math.max(0, #key - 4), 12)) .. key:sub(-4)) or "(no key)"
-		return url .. "  " .. masked
-	end
-
-	-- Pre-fetch memberships and projects to avoid sync API calls in display closures
-	local memberships_data = nil -- populated async before form opens
-	local projects_data = nil -- populated async before form opens
-	local fetched_memberships = 0
-	local fetched_projects = 0
-
-	local function org_display(_)
-		local ci = tracker.storage.current_information
-		if not ci or not ci.organization_id then
-			return "(none)"
-		end
-		if memberships_data then
-			for _, m in ipairs(memberships_data) do
-				if m.organization and m.organization.id == ci.organization_id then
-					return m.organization.name
-				end
-			end
-		end
-		return ci.organization_id
-	end
-
-	local function project_display(_)
-		local ci = tracker.storage.current_information
-		if not ci or not ci.project_id then
-			return "(none)"
-		end
-		if projects_data then
-			for _, p in ipairs(projects_data) do
-				if p.id == ci.project_id then
-					return p.name
-				end
-			end
-		end
-		return ci.project_id
-	end
-
-	local function open_status_form()
-		local fields = {
-			{
-				key = "auth",
-				label = "Auth",
-				value = true,
-				display = auth_display,
-				edit = function(_, on_done)
-					auth.prompt_api_key()
-					vim.schedule(function()
-						on_done(true)
-					end)
-				end,
-			},
-			{
-				key = "org",
-				label = "Organization",
-				value = (tracker.storage.current_information or {}).organization_id,
-				display = org_display,
-				edit = function(_, on_done)
-					M.selectActiveOrganization(function()
-						-- Re-fetch memberships after org change so display updates
-						api.getUserMemberships(function(err, data)
-							if not err and data and data.data then
-								memberships_data = data.data
-							end
-							local ci = tracker.storage.current_information
-							on_done(ci and ci.organization_id)
-						end)
-					end)
-				end,
-			},
-			{
-				key = "project",
-				label = "Project",
-				value = (tracker.storage.current_information or {}).project_id,
-				display = project_display,
-				edit = function(_, on_done)
-					M.selectActiveProject()
-					-- Re-fetch projects after project change so display updates
-					local ci = tracker.storage.current_information
-					local oid = ci and ci.organization_id
-					if oid then
-						api.getOrganizationProjects(oid, function(err, data)
-							if not err and data and data.data then
-								projects_data = data.data
-							end
-							local ci2 = tracker.storage.current_information
-							on_done(ci2 and ci2.project_id)
-						end)
-					else
-						vim.schedule(function()
-							local ci2 = tracker.storage.current_information
-							on_done(ci2 and ci2.project_id)
-						end)
-					end
-				end,
-			},
-			{ key = "__sep__", label = "" },
-			{ key = "__action__", label = "Close" },
-		}
-
-		open_form(fields, "SolidTime Status", function(_)
-			-- action = Close; nothing extra to do
-		end)
-	end
-
-	local function maybe_open()
-		if fetched_memberships == 1 and fetched_projects == 1 then
-			open_status_form()
-		end
-	end
-
-	local ci = tracker.storage.current_information
-
-	api.getUserMemberships(function(err, data)
-		if not err and data and data.data then
-			memberships_data = data.data
-		end
-		fetched_memberships = 1
-		maybe_open()
-	end)
-
-	local org_id = ci and ci.organization_id
-	if org_id then
-		api.getOrganizationProjects(org_id, function(err, data)
-			if not err and data and data.data then
-				projects_data = data.data
-			end
-			fetched_projects = 1
-			maybe_open()
-		end)
 	else
-		fetched_projects = 1
-		maybe_open()
+		all_org_projects = {}
 	end
 end
 
-function M.clientsScreen()
+function M._tab_clients()
 	local org_id = tracker.storage.current_information and tracker.storage.current_information.organization_id
 	if not org_id then
 		vim.notify("No organization selected. Run :SolidTime open first.", vim.log.levels.WARN)
 		return
 	end
 
-	local LIST_WIDTH = 60
-	local LIST_HEIGHT = 20
-
-	local row = math.floor((vim.o.lines - LIST_HEIGHT) / 2)
-	local col = math.floor((vim.o.columns - LIST_WIDTH - 2) / 2)
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = LIST_WIDTH,
-		height = LIST_HEIGHT,
-		row = row,
-		col = col,
-		style = "minimal",
-		border = "rounded",
-		title = " Clients ",
-		title_pos = "center",
-	})
-
-	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("cursorline", true, { win = win })
-
-	local clients = nil -- nil = loading
-
+	local clients = nil
 	local rows = {}
+	local search_query = ""
+	local searching = false
 
-	local function redraw()
+	local function filtered_clients()
+		if not clients then
+			return {}
+		end
+		if search_query == "" then
+			return clients
+		end
+		local q = search_query:lower()
+		local out = {}
+		for _, c in ipairs(clients) do
+			if (c.name or ""):lower():find(q, 1, true) then
+				table.insert(out, c)
+			end
+		end
+		return out
+	end
+
+	local function render(inner_w)
 		rows = {}
-		local lines = { "  Name", string.rep("─", LIST_WIDTH) }
+		local title_line
+		if searching then
+			title_line = "  Name  /  " .. search_query .. "█"
+		elseif search_query ~= "" then
+			title_line = "  Name  [/" .. search_query .. "]"
+		else
+			title_line = "  Name"
+		end
+		local lines = { title_line, string.rep("─", inner_w) }
+		local visible = filtered_clients()
 		if clients == nil then
 			table.insert(lines, "  Loading…")
+		elseif #visible == 0 and search_query ~= "" then
+			table.insert(lines, "  (no matches)")
 		elseif #clients == 0 then
 			table.insert(lines, "  (no clients — press 'a' to create one)")
 		else
-			for _, c in ipairs(clients) do
+			for _, c in ipairs(visible) do
 				table.insert(rows, c)
 				table.insert(lines, "  " .. (c.name or c.id))
 			end
 		end
-		table.insert(lines, string.rep("─", LIST_WIDTH))
-		table.insert(lines, "  a add  d delete  <CR> rename  q close")
-		if vim.api.nvim_buf_is_valid(buf) then
-			list_set_lines(buf, lines)
+		table.insert(lines, string.rep("─", inner_w))
+		if searching then
+			table.insert(lines, "  typing… <CR> confirm   <Esc> cancel")
+		elseif search_query ~= "" then
+			table.insert(lines, "  / search   <Esc> clear   a add  d delete  <CR> rename  q close")
+		else
+			table.insert(lines, "  / search   a add  d delete  <CR> rename  q close")
 		end
+		return lines
 	end
 
-	local function close()
-		list_close(win)
-	end
-	local function set_cursor_row(idx)
-		list_set_cursor(win, idx)
-	end
-	local function current_idx()
-		return list_current_idx(win, rows)
+	local function install_keymaps()
+		if not shell_is_open() then
+			return
+		end
+		local buf = shell.buf
+
+		bmap(buf, km().nav_down, function()
+			local idx = list_current_idx(rows)
+			if idx and idx < #rows then
+				list_set_cursor(idx + 1)
+			end
+		end, "Next client")
+
+		bmap(buf, km().nav_up, function()
+			local idx = list_current_idx(rows)
+			if idx and idx > 1 then
+				list_set_cursor(idx - 1)
+			end
+		end, "Previous client")
+
+		vim.keymap.set("n", "gg", function()
+			if #rows > 0 then
+				list_set_cursor(1)
+			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			if #rows > 0 then
+				list_set_cursor(#rows)
+			end
+		end, { buffer = buf, nowait = true })
+
+		bmap(buf, km().add, function()
+			shell_input("Client name: ", "", function(name)
+				if not name or name:match("^%s*$") then
+					return
+				end
+				name = name:match("^%s*(.-)%s*$")
+				api.createClient(org_id, { name = name }, function(err, data)
+					if err then
+						vim.notify("Failed to create client: " .. err, vim.log.levels.ERROR)
+						api.getOrganizationClients(org_id, function(ferr, fdata)
+							if not ferr and fdata and fdata.data then
+								clients = fdata.data
+							end
+							vim.schedule(function()
+								if shell_is_open() then
+									shell_redraw()
+								end
+							end)
+						end)
+						return
+					end
+					cache.invalidate_cache("organizations/" .. org_id .. "/clients")
+					if data and data.data then
+						table.insert(clients, data.data)
+					end
+					vim.notify("Client created: " .. name, vim.log.levels.INFO)
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							list_set_cursor(#rows)
+						end
+					end)
+				end)
+			end)
+		end, "Create client")
+
+		bmap(buf, km().confirm, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local client = rows[idx]
+			shell_input("Rename client: ", client.name or "", function(name)
+				if not name or name:match("^%s*$") then
+					return
+				end
+				name = name:match("^%s*(.-)%s*$")
+				api.updateClient(org_id, client.id, { name = name }, function(err, _)
+					if err then
+						vim.notify("Failed to rename: " .. err, vim.log.levels.ERROR)
+						return
+					end
+					cache.invalidate_cache("organizations/" .. org_id .. "/clients")
+					client.name = name
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							list_set_cursor(idx)
+						end
+					end)
+				end)
+			end)
+		end, "Rename client")
+
+		bmap(buf, km().delete, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local client = rows[idx]
+			shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+				prompt = "Delete client '" .. (client.name or client.id) .. "'?",
+				format_item = function(x)
+					return x.name
+				end,
+			}, function(choice)
+				if not choice or not choice.id then
+					return
+				end
+				api.deleteClient(org_id, client.id, function(err, _)
+					if err then
+						vim.notify("Failed to delete: " .. err, vim.log.levels.ERROR)
+						return
+					end
+					cache.invalidate_cache("organizations/" .. org_id .. "/clients")
+					for i, c in ipairs(clients) do
+						if c.id == client.id then
+							table.remove(clients, i)
+							break
+						end
+					end
+					vim.notify("Client deleted.", vim.log.levels.INFO)
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							local new_idx = math.min(idx, #rows)
+							if new_idx > 0 then
+								list_set_cursor(new_idx)
+							end
+						end
+					end)
+				end)
+			end)
+		end, "Delete client")
+
+		vim.keymap.set("n", "/", function()
+			if not shell_is_open() then
+				return
+			end
+			searching = true
+			shell_redraw()
+			vim.ui.input({ prompt = "/" }, function(input)
+				searching = false
+				if input ~= nil then
+					search_query = input
+				end
+				vim.schedule(function()
+					if shell_is_open() then
+						shell_redraw()
+						if #rows > 0 then
+							list_set_cursor(1)
+						end
+					end
+				end)
+			end)
+		end, { buffer = buf, nowait = true, desc = "Search clients" })
+
+		vim.keymap.set("n", "<Esc>", function()
+			if not shell_is_open() then
+				return
+			end
+			if search_query ~= "" then
+				search_query = ""
+				shell_redraw()
+				if #rows > 0 then
+					list_set_cursor(1)
+				end
+			end
+		end, { buffer = buf, nowait = true, desc = "Clear search" })
 	end
 
-	redraw()
+	shell_push({ render = render, install_keymaps = install_keymaps })
+
+	cache.invalidate_cache("organizations/" .. org_id .. "/clients")
 	api.getOrganizationClients(org_id, function(err, data)
 		vim.schedule(function()
-			if not vim.api.nvim_buf_is_valid(buf) then
+			if not shell_is_open() then
 				return
 			end
 			if err or not data or not data.data then
@@ -1808,197 +2584,439 @@ function M.clientsScreen()
 			else
 				clients = data.data
 			end
-			redraw()
+			shell_redraw()
 			if #rows > 0 then
-				set_cursor_row(1)
+				list_set_cursor(1)
 			end
 		end)
 	end)
-
-	bmap(buf, km().close, close, "Close")
-	bmap(buf, km().close_alt, close, "Close")
-
-	bmap(buf, km().nav_down, function()
-		local idx = current_idx()
-		if idx and idx < #rows then
-			set_cursor_row(idx + 1)
-		end
-	end, "Next client")
-
-	bmap(buf, km().nav_up, function()
-		local idx = current_idx()
-		if idx and idx > 1 then
-			set_cursor_row(idx - 1)
-		end
-	end, "Previous client")
-
-	bmap(buf, km().add, function()
-		vim.ui.input({ prompt = "Client name: " }, function(name)
-			if not name or name:match("^%s*$") then
-				return
-			end
-			name = name:match("^%s*(.-)%s*$")
-			api.createClient(org_id, { name = name }, function(err, data)
-				if err then
-					vim.notify("Failed to create client: " .. err, vim.log.levels.ERROR)
-					return
-				end
-				cache.invalidate_cache("organizations/" .. org_id .. "/clients")
-				if data and data.data then
-					table.insert(clients, data.data)
-				end
-				vim.notify("Client created: " .. name, vim.log.levels.INFO)
-				vim.schedule(function()
-					if vim.api.nvim_win_is_valid(win) then
-						redraw()
-						set_cursor_row(#rows)
-					end
-				end)
-			end)
-		end)
-	end, "Create client")
-
-	bmap(buf, km().confirm, function()
-		local idx = current_idx()
-		if not idx then
-			return
-		end
-		local client = rows[idx]
-		vim.ui.input({ prompt = "Rename client: ", default = client.name or "" }, function(name)
-			if not name or name:match("^%s*$") then
-				return
-			end
-			name = name:match("^%s*(.-)%s*$")
-			api.updateClient(org_id, client.id, { name = name }, function(err, _)
-				if err then
-					vim.notify("Failed to rename: " .. err, vim.log.levels.ERROR)
-					return
-				end
-				cache.invalidate_cache("organizations/" .. org_id .. "/clients")
-				client.name = name
-				vim.schedule(function()
-					if vim.api.nvim_win_is_valid(win) then
-						redraw()
-						set_cursor_row(idx)
-					end
-				end)
-			end)
-		end)
-	end, "Rename client")
-
-	bmap(buf, km().delete, function()
-		local idx = current_idx()
-		if not idx then
-			return
-		end
-		local client = rows[idx]
-		vim.ui.select({ "No", "Yes" }, {
-			prompt = "Delete client '" .. (client.name or client.id) .. "'?",
-		}, function(choice)
-			if choice ~= "Yes" then
-				return
-			end
-			api.deleteClient(org_id, client.id, function(err, _)
-				if err then
-					vim.notify("Failed to delete: " .. err, vim.log.levels.ERROR)
-					return
-				end
-				cache.invalidate_cache("organizations/" .. org_id .. "/clients")
-				for i, c in ipairs(clients) do
-					if c.id == client.id then
-						table.remove(clients, i)
-						break
-					end
-				end
-				vim.notify("Client deleted.", vim.log.levels.INFO)
-				vim.schedule(function()
-					if vim.api.nvim_win_is_valid(win) then
-						redraw()
-						local new_idx = math.min(idx, #rows)
-						if new_idx > 0 then
-							set_cursor_row(new_idx)
-						end
-					end
-				end)
-			end)
-		end)
-	end, "Delete client")
 end
 
---- Open the tasks list for a specific project.
----@param project_id string   Solidtime project UUID
----@param project_name string|nil  Display name for the title bar
-function M.tasksScreen(project_id, project_name)
+--- Internal tasks view — renders task list for a specific project.
+---@param project_id string
+---@param project_name string|nil
+function M._tab_tasks(project_id, project_name)
 	local ci = tracker.storage.current_information
 	local org_id = ci and ci.organization_id
+
+	if not project_id then
+		if not org_id then
+			vim.notify("No organization selected. Run :SolidTime open first.", vim.log.levels.WARN)
+			return
+		end
+
+		local picker_projects = nil
+		local picker_rows = {}
+		local picker_search_query = ""
+		local picker_searching = false
+
+		local function picker_filtered()
+			if not picker_projects then
+				return {}
+			end
+			if picker_search_query == "" then
+				return picker_projects
+			end
+			local q = picker_search_query:lower()
+			local out = {}
+			for _, p in ipairs(picker_projects) do
+				if (p.name or ""):lower():find(q, 1, true) then
+					table.insert(out, p)
+				end
+			end
+			return out
+		end
+
+		local function picker_render(inner_w)
+			picker_rows = {}
+			local title_line
+			if picker_searching then
+				title_line = "  Select a project  /  " .. picker_search_query .. "█"
+			elseif picker_search_query ~= "" then
+				title_line = "  Select a project  [/" .. picker_search_query .. "]"
+			else
+				title_line = "  Select a project"
+			end
+			local lines = { title_line, string.rep("─", inner_w) }
+			local visible = picker_filtered()
+			if picker_projects == nil then
+				table.insert(lines, "  Loading…")
+			elseif #visible == 0 and picker_search_query ~= "" then
+				table.insert(lines, "  (no matches)")
+			elseif #picker_projects == 0 then
+				table.insert(lines, "  (no projects found)")
+			else
+				for _, p in ipairs(visible) do
+					table.insert(picker_rows, p)
+					table.insert(lines, "  " .. (p.name or p.id))
+				end
+			end
+			table.insert(lines, string.rep("─", inner_w))
+			if picker_searching then
+				table.insert(lines, "  typing… <CR> confirm   <Esc> cancel")
+			elseif picker_search_query ~= "" then
+				table.insert(lines, "  / search   <Esc> clear   <CR> select   q close")
+			else
+				table.insert(lines, "  / search   <CR> select   q close")
+			end
+			return lines
+		end
+
+		local function picker_install_keymaps()
+			if not shell_is_open() then
+				return
+			end
+			local buf = shell.buf
+			bmap(buf, km().nav_down, function()
+				local idx = list_current_idx(picker_rows)
+				if idx and idx < #picker_rows then
+					list_set_cursor(idx + 1)
+				end
+			end, "Next project")
+			bmap(buf, km().nav_up, function()
+				local idx = list_current_idx(picker_rows)
+				if idx and idx > 1 then
+					list_set_cursor(idx - 1)
+				end
+			end, "Previous project")
+			vim.keymap.set("n", "gg", function()
+				if #picker_rows > 0 then
+					list_set_cursor(1)
+				end
+			end, { buffer = buf, nowait = true })
+			vim.keymap.set("n", "G", function()
+				if #picker_rows > 0 then
+					list_set_cursor(#picker_rows)
+				end
+			end, { buffer = buf, nowait = true })
+			bmap(buf, km().confirm, function()
+				local idx = list_current_idx(picker_rows)
+				if not idx then
+					return
+				end
+				local selected = picker_rows[idx]
+				table.remove(shell.stack)
+				M._tab_tasks(selected.id, selected.name)
+			end, "Select project")
+
+			vim.keymap.set("n", "/", function()
+				if not shell_is_open() then
+					return
+				end
+				picker_searching = true
+				shell_redraw()
+				vim.ui.input({ prompt = "/" }, function(input)
+					picker_searching = false
+					if input ~= nil then
+						picker_search_query = input
+					end
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							if #picker_rows > 0 then
+								list_set_cursor(1)
+							end
+						end
+					end)
+				end)
+			end, { buffer = buf, nowait = true, desc = "Search projects" })
+
+			vim.keymap.set("n", "<Esc>", function()
+				if not shell_is_open() then
+					return
+				end
+				if picker_search_query ~= "" then
+					picker_search_query = ""
+					shell_redraw()
+					if #picker_rows > 0 then
+						list_set_cursor(1)
+					end
+				end
+			end, { buffer = buf, nowait = true, desc = "Clear search" })
+		end
+
+		shell_push({ render = picker_render, install_keymaps = picker_install_keymaps })
+
+		cache.invalidate_cache("organizations/" .. org_id .. "/projects")
+		api.getOrganizationProjects(org_id, function(err, data)
+			vim.schedule(function()
+				if not shell_is_open() then
+					return
+				end
+				if err or not data or not data.data then
+					picker_projects = {}
+					vim.notify("No projects found.", vim.log.levels.WARN)
+				else
+					picker_projects = data.data
+				end
+				shell_redraw()
+				if #picker_rows > 0 then
+					list_set_cursor(1)
+				end
+			end)
+		end)
+		return
+	end
 
 	if not org_id then
 		vim.notify("No organization selected. Run :SolidTime open first.", vim.log.levels.WARN)
 		return
 	end
 
-	local LIST_WIDTH = 64
-	local LIST_HEIGHT = 22
-
-	local row_win = math.floor((vim.o.lines - LIST_HEIGHT) / 2)
-	local col_win = math.floor((vim.o.columns - LIST_WIDTH - 2) / 2)
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = LIST_WIDTH,
-		height = LIST_HEIGHT,
-		row = row_win,
-		col = col_win,
-		style = "minimal",
-		border = "rounded",
-		title = " Tasks: " .. (project_name or project_id) .. " ",
-		title_pos = "center",
-	})
-
-	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("cursorline", true, { win = win })
-
-	local tasks = nil -- nil = loading
+	local tasks = nil
 	local rows = {}
+	local search_query = ""
+	local searching = false
 
-	local function redraw()
+	local function filtered_tasks()
+		if not tasks then
+			return {}
+		end
+		if search_query == "" then
+			return tasks
+		end
+		local q = search_query:lower()
+		local out = {}
+		for _, t in ipairs(tasks) do
+			if (t.name or ""):lower():find(q, 1, true) then
+				table.insert(out, t)
+			end
+		end
+		return out
+	end
+
+	local function render(inner_w)
 		rows = {}
-		local lines = { "  Done  Name", string.rep("─", LIST_WIDTH) }
+		local title_line
+		if searching then
+			title_line = "  Tasks: " .. (project_name or project_id) .. "  /  " .. search_query .. "█"
+		elseif search_query ~= "" then
+			title_line = "  Tasks: " .. (project_name or project_id) .. "  [/" .. search_query .. "]"
+		else
+			title_line = "  Tasks: " .. (project_name or project_id)
+		end
+		local lines = { title_line, string.rep("─", inner_w) }
+		local visible = filtered_tasks()
 		if tasks == nil then
 			table.insert(lines, "  Loading…")
+		elseif #visible == 0 and search_query ~= "" then
+			table.insert(lines, "  (no matches)")
 		elseif #tasks == 0 then
 			table.insert(lines, "  (no tasks — press 'a' to create one)")
 		else
-			for _, t in ipairs(tasks) do
+			for _, t in ipairs(visible) do
 				table.insert(rows, t)
 				local check = t.is_done and "[x]" or "[ ]"
 				table.insert(lines, string.format("  %s  %s", check, t.name or t.id))
 			end
 		end
-		table.insert(lines, string.rep("─", LIST_WIDTH))
-		table.insert(lines, "  a add  d delete  <CR> rename/toggle  q close")
-		if vim.api.nvim_buf_is_valid(buf) then
-			list_set_lines(buf, lines)
+		table.insert(lines, string.rep("─", inner_w))
+		if searching then
+			table.insert(lines, "  typing… <CR> confirm   <Esc> cancel")
+		elseif search_query ~= "" then
+			table.insert(lines, "  / search   <Esc> clear   a add  d delete  <CR> toggle  r rename  p project  q close")
+		else
+			table.insert(lines, "  / search   a add  d delete  <CR> toggle done  r rename  p project  q close")
 		end
+		return lines
 	end
 
-	local function close()
-		list_close(win)
-	end
-	local function set_cursor_row(idx)
-		list_set_cursor(win, idx)
-	end
-	local function current_idx()
-		return list_current_idx(win, rows)
+	local function install_keymaps()
+		if not shell_is_open() then
+			return
+		end
+		local buf = shell.buf
+
+		bmap(buf, km().nav_down, function()
+			local idx = list_current_idx(rows)
+			if idx and idx < #rows then
+				list_set_cursor(idx + 1)
+			end
+		end, "Next task")
+
+		bmap(buf, km().nav_up, function()
+			local idx = list_current_idx(rows)
+			if idx and idx > 1 then
+				list_set_cursor(idx - 1)
+			end
+		end, "Previous task")
+
+		vim.keymap.set("n", "gg", function()
+			if #rows > 0 then
+				list_set_cursor(1)
+			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			if #rows > 0 then
+				list_set_cursor(#rows)
+			end
+		end, { buffer = buf, nowait = true })
+
+		bmap(buf, km().add, function()
+			shell_input("Task name:", "", function(name)
+				if not name then
+					return
+				end
+				api.createTask(org_id, { name = name, is_done = false, project_id = project_id }, function(err, result)
+					if err or (result and result.error) then
+						vim.notify("Failed to create task: " .. tostring(err or result.error), vim.log.levels.ERROR)
+						return
+					end
+					if result and result.data then
+						table.insert(tasks, result.data)
+					end
+					vim.notify("Task created: " .. name, vim.log.levels.INFO)
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							list_set_cursor(#rows)
+						end
+					end)
+				end)
+			end)
+		end, "Create task")
+
+		bmap(buf, km().confirm, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local task = rows[idx]
+			api.updateTask(org_id, task.id, { name = task.name, is_done = not task.is_done }, function(err, result)
+				if err or (result and result.error) then
+					vim.notify("Failed to update task: " .. tostring(err or result.error), vim.log.levels.ERROR)
+					return
+				end
+				local marking_done = not task.is_done
+				task.is_done = marking_done
+				if marking_done then
+					require("solidtime.autotrack").clear_done_task(project_id, task.id)
+				end
+				vim.schedule(function()
+					if shell_is_open() then
+						shell_redraw()
+						list_set_cursor(idx)
+					end
+				end)
+			end)
+		end, "Toggle task done")
+
+		vim.keymap.set("n", "r", function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local task = rows[idx]
+			shell_input("Rename task:", task.name or "", function(name)
+				if not name then
+					return
+				end
+				api.updateTask(org_id, task.id, { name = name, is_done = task.is_done }, function(err, result)
+					if err or (result and result.error) then
+						vim.notify("Failed to rename task: " .. tostring(err or result.error), vim.log.levels.ERROR)
+						return
+					end
+					task.name = name
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							list_set_cursor(idx)
+						end
+					end)
+				end)
+			end)
+		end, { buffer = buf, nowait = true, desc = "Rename task" })
+
+		bmap(buf, km().delete, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local task = rows[idx]
+			shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+				prompt = "Delete task '" .. (task.name or task.id) .. "'?",
+				format_item = function(x)
+					return x.name
+				end,
+			}, function(choice)
+				if not choice or not choice.id then
+					return
+				end
+				api.deleteTask(org_id, task.id, function(err, result)
+					if err or (result and result.error) then
+						vim.notify("Failed to delete task: " .. tostring(err or result.error), vim.log.levels.ERROR)
+						return
+					end
+					for i, t in ipairs(tasks) do
+						if t.id == task.id then
+							table.remove(tasks, i)
+							break
+						end
+					end
+					vim.notify("Task deleted.", vim.log.levels.INFO)
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							local new_idx = math.min(idx, #rows)
+							if new_idx > 0 then
+								list_set_cursor(new_idx)
+							end
+						end
+					end)
+				end)
+			end)
+		end, "Delete task")
+
+		vim.keymap.set("n", "p", function()
+			if not shell_is_open() then
+				return
+			end
+			table.remove(shell.stack)
+			M._tab_tasks(nil, nil)
+		end, { buffer = buf, nowait = true, desc = "Switch project" })
+
+		vim.keymap.set("n", "/", function()
+			if not shell_is_open() then
+				return
+			end
+			searching = true
+			shell_redraw()
+			vim.ui.input({ prompt = "/" }, function(input)
+				searching = false
+				if input ~= nil then
+					search_query = input
+				end
+				vim.schedule(function()
+					if shell_is_open() then
+						shell_redraw()
+						if #rows > 0 then
+							list_set_cursor(1)
+						end
+					end
+				end)
+			end)
+		end, { buffer = buf, nowait = true, desc = "Search tasks" })
+
+		vim.keymap.set("n", "<Esc>", function()
+			if not shell_is_open() then
+				return
+			end
+			if search_query ~= "" then
+				search_query = ""
+				shell_redraw()
+				if #rows > 0 then
+					list_set_cursor(1)
+				end
+			end
+		end, { buffer = buf, nowait = true, desc = "Clear search" })
 	end
 
-	-- Initial async load
-	redraw()
+	shell_push({ render = render, install_keymaps = install_keymaps })
+
+	cache.invalidate_cache_prefix("organizations/" .. org_id .. "/tasks")
 	api.getOrganizationTasks(org_id, { project_id = project_id }, function(err, data)
 		vim.schedule(function()
-			if not vim.api.nvim_buf_is_valid(buf) then
+			if not shell_is_open() then
 				return
 			end
 			if err or not data or not data.data then
@@ -2007,160 +3025,15 @@ function M.tasksScreen(project_id, project_name)
 			else
 				tasks = data.data
 			end
-			redraw()
+			shell_redraw()
 			if #rows > 0 then
-				set_cursor_row(1)
+				list_set_cursor(1)
 			end
 		end)
 	end)
-
-	bmap(buf, km().close, close, "Close")
-	bmap(buf, km().close_alt, close, "Close")
-
-	bmap(buf, km().nav_down, function()
-		local idx = current_idx()
-		if idx and idx < #rows then
-			set_cursor_row(idx + 1)
-		end
-	end, "Next task")
-
-	bmap(buf, km().nav_up, function()
-		local idx = current_idx()
-		if idx and idx > 1 then
-			set_cursor_row(idx - 1)
-		end
-	end, "Previous task")
-
-	bmap(buf, km().add, function()
-		vim.ui.input({ prompt = "Task name: " }, function(name)
-			if not name or name:match("^%s*$") then
-				return
-			end
-			name = name:match("^%s*(.-)%s*$")
-			api.createTask(org_id, {
-				name = name,
-				is_done = false,
-				project_id = project_id,
-			}, function(err, result)
-				if err or (result and result.error) then
-					vim.notify("Failed to create task: " .. tostring(err or result.error), vim.log.levels.ERROR)
-					return
-				end
-				if result and result.data then
-					table.insert(tasks, result.data)
-				end
-				vim.notify("Task created: " .. name, vim.log.levels.INFO)
-				if vim.api.nvim_win_is_valid(win) then
-					redraw()
-					set_cursor_row(#rows)
-				end
-			end)
-		end)
-	end, "Create task")
-
-	bmap(buf, km().confirm, function()
-		local idx = current_idx()
-		if not idx then
-			return
-		end
-		local task = rows[idx]
-
-		local choices = {
-			{ label = "Toggle done (" .. (task.is_done and "mark undone" or "mark done") .. ")" },
-			{ label = "Rename" },
-		}
-		vim.ui.select(choices, {
-			prompt = "Task: " .. (task.name or task.id),
-			format_item = function(c)
-				return c.label
-			end,
-		}, function(choice)
-			if not choice then
-				return
-			end
-
-			if choice.label:match("^Toggle") then
-				api.updateTask(org_id, task.id, {
-					name = task.name,
-					is_done = not task.is_done,
-				}, function(err, result)
-					if err or (result and result.error) then
-						vim.notify("Failed to update task: " .. tostring(err or result.error), vim.log.levels.ERROR)
-						return
-					end
-					local marking_done = not task.is_done
-					task.is_done = marking_done
-					if marking_done then
-						require("solidtime.autotrack").clear_done_task(project_id, task.id)
-					end
-					if vim.api.nvim_win_is_valid(win) then
-						redraw()
-						set_cursor_row(idx)
-					end
-				end)
-			else
-				-- rename
-				vim.ui.input({ prompt = "Rename task: ", default = task.name or "" }, function(name)
-					if not name or name:match("^%s*$") then
-						return
-					end
-					name = name:match("^%s*(.-)%s*$")
-					api.updateTask(org_id, task.id, {
-						name = name,
-						is_done = task.is_done,
-					}, function(err, result)
-						if err or (result and result.error) then
-							vim.notify("Failed to rename task: " .. tostring(err or result.error), vim.log.levels.ERROR)
-							return
-						end
-						task.name = name
-						if vim.api.nvim_win_is_valid(win) then
-							redraw()
-							set_cursor_row(idx)
-						end
-					end)
-				end)
-			end
-		end)
-	end, "Edit task")
-
-	bmap(buf, km().delete, function()
-		local idx = current_idx()
-		if not idx then
-			return
-		end
-		local task = rows[idx]
-		vim.ui.select({ "No", "Yes" }, {
-			prompt = "Delete task '" .. (task.name or task.id) .. "'?",
-		}, function(choice)
-			if choice ~= "Yes" then
-				return
-			end
-			api.deleteTask(org_id, task.id, function(err, result)
-				if err or (result and result.error) then
-					vim.notify("Failed to delete task: " .. tostring(err or result.error), vim.log.levels.ERROR)
-					return
-				end
-				for i, t in ipairs(tasks) do
-					if t.id == task.id then
-						table.remove(tasks, i)
-						break
-					end
-				end
-				vim.notify("Task deleted.", vim.log.levels.INFO)
-				if vim.api.nvim_win_is_valid(win) then
-					redraw()
-					local new_idx = math.min(idx, #rows)
-					if new_idx > 0 then
-						set_cursor_row(new_idx)
-					end
-				end
-			end)
-		end)
-	end, "Delete task")
 end
 
-function M.timeEntriesScreen()
+function M._tab_entries()
 	local ci = tracker.storage.current_information
 	local org_id = ci and ci.organization_id
 	local member_id = ci and ci.member_id
@@ -2170,46 +3043,10 @@ function M.timeEntriesScreen()
 		return
 	end
 
-	local LIST_WIDTH = 90
-	local LIST_HEIGHT = 24
-
 	local COL_DATE = 12
 	local COL_DUR = 8
 	local COL_PROJ = 20
 	local COL_BILL = 6
-
-	local function make_header()
-		return "  "
-			.. pad("Date", COL_DATE)
-			.. "│ "
-			.. pad("Duration", COL_DUR)
-			.. "│ "
-			.. pad("Project", COL_PROJ)
-			.. "│ "
-			.. pad("Bill", COL_BILL)
-			.. "│ Description"
-	end
-
-	local row_win = math.floor((vim.o.lines - LIST_HEIGHT) / 2)
-	local col_win = math.floor((vim.o.columns - LIST_WIDTH - 2) / 2)
-
-	local buf = vim.api.nvim_create_buf(false, true)
-	local win = vim.api.nvim_open_win(buf, true, {
-		relative = "editor",
-		width = LIST_WIDTH,
-		height = LIST_HEIGHT,
-		row = row_win,
-		col = col_win,
-		style = "minimal",
-		border = "rounded",
-		title = " Time Entries ",
-		title_pos = "center",
-	})
-
-	vim.api.nvim_set_option_value("buftype", "acwrite", { buf = buf })
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("cursorline", true, { win = win })
-	vim.api.nvim_buf_set_name(buf, "solidtime://time-entries")
 
 	local current_page = 1
 	local total_pages = 1
@@ -2217,22 +3054,20 @@ function M.timeEntriesScreen()
 	local rows = {}
 	local proj_map = {}
 	local pending_deletes = {}
+	local search_query = ""
+	local searching = false
 
-	if org_id then
-		api.getOrganizationProjects(org_id, function(err, data)
-			if not err and data and data.data then
-				for _, p in ipairs(data.data) do
-					proj_map[p.id] = p.name
-				end
+	-- Pre-fetch project names
+	api.getOrganizationProjects(org_id, function(err, data)
+		if not err and data and data.data then
+			for _, p in ipairs(data.data) do
+				proj_map[p.id] = p.name
 			end
-		end)
-	end
+		end
+	end)
 
 	local function fmt_duration(start_str, end_str)
 		if not start_str or not end_str then
-			return "—"
-		end
-		if type(start_str) ~= "string" or type(end_str) ~= "string" then
 			return "—"
 		end
 		local function parse_iso(s)
@@ -2245,8 +3080,7 @@ function M.timeEntriesScreen()
 			end
 			return os.time({ year = y, month = mo, day = d, hour = h, min = mi, sec = sec })
 		end
-		local t1 = parse_iso(start_str)
-		local t2 = parse_iso(end_str)
+		local t1, t2 = parse_iso(start_str), parse_iso(end_str)
 		if not t1 or not t2 then
 			return "?"
 		end
@@ -2266,16 +3100,56 @@ function M.timeEntriesScreen()
 		return s:sub(1, 10)
 	end
 
-	local function redraw()
-		rows = {}
-		local lines = { make_header(), string.rep("─", LIST_WIDTH) }
+	local function filtered_entries()
+		if not entries then
+			return {}
+		end
+		if search_query == "" then
+			return entries
+		end
+		local q = search_query:lower()
+		local out = {}
+		for _, e in ipairs(entries) do
+			local desc = (e.description or ""):lower()
+			local proj = (proj_map[e.project_id] or ""):lower()
+			if desc:find(q, 1, true) or proj:find(q, 1, true) then
+				table.insert(out, e)
+			end
+		end
+		return out
+	end
 
+	local function render(inner_w)
+		rows = {}
+		local title_line
+		if searching then
+			title_line = "  Date        │ Dur     │ Project             │ Bill  │ Description  /  "
+				.. search_query
+				.. "█"
+		elseif search_query ~= "" then
+			title_line = "  Date        │ Dur     │ Project             │ Bill  │ [/" .. search_query .. "]"
+		else
+			title_line = "  "
+				.. pad("Date", COL_DATE)
+				.. "│ "
+				.. pad("Duration", COL_DUR)
+				.. "│ "
+				.. pad("Project", COL_PROJ)
+				.. "│ "
+				.. pad("Bill", COL_BILL)
+				.. "│ Description"
+		end
+		local lines = { title_line, string.rep("─", inner_w) }
+
+		local visible = filtered_entries()
 		if entries == nil then
 			table.insert(lines, "  Loading…")
+		elseif #visible == 0 and search_query ~= "" then
+			table.insert(lines, "  (no matches)")
 		elseif #entries == 0 then
 			table.insert(lines, "  (no time entries found)")
 		else
-			for _, e in ipairs(entries) do
+			for _, e in ipairs(visible) do
 				table.insert(rows, e)
 				local proj = proj_map[e.project_id] or "(none)"
 				local dur = fmt_duration(e.start, e["end"])
@@ -2298,49 +3172,46 @@ function M.timeEntriesScreen()
 			end
 		end
 
-		table.insert(lines, string.rep("─", LIST_WIDTH))
+		table.insert(lines, string.rep("─", inner_w))
 		local page_info = string.format("page %d/%d", current_page, total_pages)
-		local staged_count = (function()
-			local n = 0
-			for _ in pairs(pending_deletes) do
-				n = n + 1
-			end
-			return n
-		end)()
-		local hint = staged_count > 0
-				and string.format(
-					"  [ prev  ] next  <CR> edit  d delete  %s  :w commit (%d staged)  q close",
-					page_info,
-					staged_count
-				)
-			or string.format("  [ prev  ] next  <CR> edit  d delete  %s  q close", page_info)
-		table.insert(lines, hint)
-
-		if vim.api.nvim_buf_is_valid(buf) then
-			list_set_lines(buf, lines)
+		local staged_count = 0
+		for _ in pairs(pending_deletes) do
+			staged_count = staged_count + 1
 		end
-	end
-
-	local function close()
-		list_close(win)
-	end
-	local function set_cursor_row(idx)
-		list_set_cursor(win, idx)
-	end
-	local function current_idx()
-		return list_current_idx(win, rows)
+		local hint
+		if searching then
+			hint = "  typing… <CR> confirm   <Esc> cancel"
+		elseif search_query ~= "" then
+			hint = staged_count > 0
+					and string.format(
+						"  / search   <Esc> clear   [ prev  ] next  <CR> edit  d del  %s  :w commit (%d staged)  q close",
+						page_info,
+						staged_count
+					)
+				or string.format("  / search   <Esc> clear   [ prev  ] next  <CR> edit  d del  %s  q close", page_info)
+		else
+			hint = staged_count > 0
+					and string.format(
+						"  / search   [ prev  ] next  <CR> edit  d del  %s  :w commit (%d staged)  q close",
+						page_info,
+						staged_count
+					)
+				or string.format("  / search   [ prev  ] next  <CR> edit  d del  %s  q close", page_info)
+		end
+		table.insert(lines, hint)
+		return lines
 	end
 
 	local function load_page(page)
 		entries = nil
-		redraw()
+		shell_redraw()
 		local params = { page = page }
 		if member_id then
 			params.member_ids = { member_id }
 		end
 		api.getOrganizationTimeEntries(org_id, params, function(err, data)
 			vim.schedule(function()
-				if not vim.api.nvim_buf_is_valid(buf) then
+				if not shell_is_open() then
 					return
 				end
 				if err or not data or not data.data then
@@ -2352,68 +3223,28 @@ function M.timeEntriesScreen()
 						total_pages = data.meta.last_page
 					end
 				end
-				redraw()
+				shell_redraw()
 				if #rows > 0 then
-					set_cursor_row(1)
+					list_set_cursor(1)
 				end
 			end)
 		end)
 	end
 
-	load_page(1)
-
-	bmap(buf, km().close, close, "Close")
-	bmap(buf, km().close_alt, close, "Close")
-
-	bmap(buf, km().nav_down, function()
-		local idx = current_idx()
-		if idx and idx < #rows then
-			set_cursor_row(idx + 1)
-		end
-	end, "Next entry")
-
-	bmap(buf, km().nav_up, function()
-		local idx = current_idx()
-		if idx and idx > 1 then
-			set_cursor_row(idx - 1)
-		end
-	end, "Previous entry")
-
-	bmap(buf, km().next_page, function()
-		if current_page < total_pages then
-			current_page = current_page + 1
-			load_page(current_page)
-		end
-	end, "Next page")
-
-	bmap(buf, km().prev_page, function()
-		if current_page > 1 then
-			current_page = current_page - 1
-			load_page(current_page)
-		end
-	end, "Previous page")
-
-	bmap(buf, km().confirm, function()
-		local idx = current_idx()
-		if not idx then
-			return
-		end
-		local entry = rows[idx]
-
+	local function open_entry_edit_form(idx, entry)
 		local entry_project_map = {}
 		local entry_task_map = {}
 		local entry_tag_map = {}
 		local fetched_projects = 0
 		local fetched_tags = 0
 		local fetched_tasks = 0
-		local need_tasks = entry.project_id and entry.task_id and 1 or 0
+		local need_tasks = (entry.project_id and entry.task_id) and 1 or 0
 
-		-- Copy already-known project names from the list's proj_map
 		for k, v in pairs(proj_map) do
 			entry_project_map[k] = v
 		end
 
-		local function open_entry_edit_form()
+		local function open_form_now()
 			local fields = {}
 			make_time_entry_fields(org_id, {
 				description = entry.description,
@@ -2448,9 +3279,9 @@ function M.timeEntriesScreen()
 					entry.tags = vals.tags
 					vim.notify("Entry updated.", vim.log.levels.INFO)
 					vim.schedule(function()
-						if vim.api.nvim_win_is_valid(win) then
-							redraw()
-							set_cursor_row(idx)
+						if shell_is_open() then
+							shell_redraw()
+							list_set_cursor(idx)
 						end
 					end)
 				end)
@@ -2459,11 +3290,10 @@ function M.timeEntriesScreen()
 
 		local function maybe_open_entry()
 			if fetched_projects == 1 and fetched_tags == 1 and fetched_tasks == need_tasks then
-				open_entry_edit_form()
+				open_form_now()
 			end
 		end
 
-		-- If proj_map is already populated, skip the project fetch
 		if next(entry_project_map) ~= nil then
 			fetched_projects = 1
 		else
@@ -2504,118 +3334,286 @@ function M.timeEntriesScreen()
 		if fetched_projects == 1 then
 			maybe_open_entry()
 		end
-	end, "Edit entry")
+	end
 
-	bmap(buf, km().delete, function()
-		local idx = current_idx()
-		if not idx then
+	local function install_keymaps()
+		if not shell_is_open() then
 			return
 		end
-		local entry = rows[idx]
-		local label = (entry.description and entry.description ~= "") and entry.description or fmt_date(entry.start)
+		local buf = shell.buf
 
-		vim.ui.select({ "No", "Yes" }, {
-			prompt = "Delete entry '" .. label .. "'?",
-		}, function(choice)
-			if choice ~= "Yes" then
+		bmap(buf, km().nav_down, function()
+			local idx = list_current_idx(rows)
+			if idx and idx < #rows then
+				list_set_cursor(idx + 1)
+			end
+		end, "Next entry")
+
+		bmap(buf, km().nav_up, function()
+			local idx = list_current_idx(rows)
+			if idx and idx > 1 then
+				list_set_cursor(idx - 1)
+			end
+		end, "Previous entry")
+
+		vim.keymap.set("n", "gg", function()
+			if #rows > 0 then
+				list_set_cursor(1)
+			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "G", function()
+			if #rows > 0 then
+				list_set_cursor(#rows)
+			end
+		end, { buffer = buf, nowait = true })
+
+		bmap(buf, km().next_page, function()
+			if current_page < total_pages then
+				current_page = current_page + 1
+				load_page(current_page)
+			end
+		end, "Next page")
+
+		bmap(buf, km().prev_page, function()
+			if current_page > 1 then
+				current_page = current_page - 1
+				load_page(current_page)
+			end
+		end, "Previous page")
+
+		bmap(buf, km().confirm, function()
+			local idx = list_current_idx(rows)
+			if not idx then
 				return
 			end
-			api.deleteTimeEntry(org_id, entry.id, function(err, _)
-				if err then
-					vim.notify("Failed to delete: " .. err, vim.log.levels.ERROR)
+			open_entry_edit_form(idx, rows[idx])
+		end, "Edit entry")
+
+		bmap(buf, km().delete, function()
+			local idx = list_current_idx(rows)
+			if not idx then
+				return
+			end
+			local entry = rows[idx]
+			local label = (entry.description and entry.description ~= "") and entry.description or fmt_date(entry.start)
+			shell_select({ { id = false, name = "No" }, { id = true, name = "Yes" } }, {
+				prompt = "Delete entry '" .. label .. "'?",
+				format_item = function(x)
+					return x.name
+				end,
+			}, function(choice)
+				if not choice or not choice.id then
 					return
 				end
-				pending_deletes[entry.id] = nil
-				for i, e in ipairs(entries) do
-					if e.id == entry.id then
-						table.remove(entries, i)
-						break
+				api.deleteTimeEntry(org_id, entry.id, function(err, _)
+					if err then
+						vim.notify("Failed to delete: " .. err, vim.log.levels.ERROR)
+						return
+					end
+					pending_deletes[entry.id] = nil
+					for i, e in ipairs(entries) do
+						if e.id == entry.id then
+							table.remove(entries, i)
+							break
+						end
+					end
+					vim.notify("Entry deleted.", vim.log.levels.INFO)
+					vim.schedule(function()
+						if shell_is_open() then
+							shell_redraw()
+							local new_idx = math.min(idx, #rows)
+							if new_idx > 0 then
+								list_set_cursor(new_idx)
+							end
+						end
+					end)
+				end)
+			end)
+		end, "Delete entry")
+
+		-- Visual-mode bulk stage
+		if km().delete and km().delete ~= false and km().delete ~= "" then
+			vim.keymap.set("v", km().delete, function()
+				local vstart = vim.fn.line("v")
+				local vend = vim.fn.line(".")
+				if vstart > vend then
+					vstart, vend = vend, vstart
+				end
+				vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+				for lnum = vstart, vend do
+					local row_idx = lnum - LIST_HEADER_LINES
+					if row_idx >= 1 and row_idx <= #rows then
+						pending_deletes[rows[row_idx].id] = true
 					end
 				end
-				vim.notify("Entry deleted.", vim.log.levels.INFO)
+				shell_redraw()
+			end, { buffer = buf, nowait = true, desc = "Stage entries for deletion" })
+		end
+
+		vim.api.nvim_create_autocmd("BufWriteCmd", {
+			buffer = buf,
+			callback = function()
+				local ids = {}
+				for id in pairs(pending_deletes) do
+					table.insert(ids, id)
+				end
+				if #ids == 0 then
+					vim.notify("Nothing staged for deletion.", vim.log.levels.INFO)
+					return
+				end
+				local total = #ids
+				local done_count = 0
+				local fail_count = 0
+				for _, id in ipairs(ids) do
+					api.deleteTimeEntry(org_id, id, function(err, _)
+						done_count = done_count + 1
+						if err then
+							fail_count = fail_count + 1
+							vim.notify("Failed to delete entry: " .. err, vim.log.levels.ERROR)
+						else
+							pending_deletes[id] = nil
+							for i, e in ipairs(entries) do
+								if e.id == id then
+									table.remove(entries, i)
+									break
+								end
+							end
+						end
+						if done_count == total then
+							local deleted = total - fail_count
+							if deleted > 0 then
+								vim.notify(
+									string.format("Deleted %d entr%s.", deleted, deleted == 1 and "y" or "ies"),
+									vim.log.levels.INFO
+								)
+							end
+							vim.bo[buf].modified = false
+							vim.schedule(function()
+								if shell_is_open() then
+									shell_redraw()
+									local cur_idx = list_current_idx(rows)
+									if #rows > 0 then
+										list_set_cursor(math.min(cur_idx or 1, #rows))
+									end
+								end
+							end)
+						end
+					end)
+				end
+			end,
+		})
+
+		vim.keymap.set("n", "/", function()
+			if not shell_is_open() then
+				return
+			end
+			searching = true
+			shell_redraw()
+			vim.ui.input({ prompt = "/" }, function(input)
+				searching = false
+				if input ~= nil then
+					search_query = input
+				end
 				vim.schedule(function()
-					if vim.api.nvim_win_is_valid(win) then
-						redraw()
-						local new_idx = math.min(idx, #rows)
-						if new_idx > 0 then
-							set_cursor_row(new_idx)
+					if shell_is_open() then
+						shell_redraw()
+						if #rows > 0 then
+							list_set_cursor(1)
 						end
 					end
 				end)
 			end)
-		end)
-	end, "Delete entry")
+		end, { buffer = buf, nowait = true, desc = "Search entries" })
 
-	if km().delete and km().delete ~= false and km().delete ~= "" then
-		vim.keymap.set("v", km().delete, function()
-			local vstart = vim.fn.line("v")
-			local vend = vim.fn.line(".")
-			if vstart > vend then
-				vstart, vend = vend, vstart
-			end
-			vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
-			for lnum = vstart, vend do
-				local idx = lnum - LIST_HEADER_LINES
-				if idx >= 1 and idx <= #rows then
-					local entry = rows[idx]
-					pending_deletes[entry.id] = true
-				end
-			end
-			redraw()
-		end, { buffer = buf, nowait = true, desc = "Stage entries for deletion" })
-	end
-
-	vim.api.nvim_create_autocmd("BufWriteCmd", {
-		buffer = buf,
-		callback = function()
-			local ids = {}
-			for id in pairs(pending_deletes) do
-				table.insert(ids, id)
-			end
-			if #ids == 0 then
-				vim.notify("Nothing staged for deletion.", vim.log.levels.INFO)
+		vim.keymap.set("n", "<Esc>", function()
+			if not shell_is_open() then
 				return
 			end
-			local total = #ids
-			local done_count = 0
-			local failed_count = 0
-			for _, id in ipairs(ids) do
-				api.deleteTimeEntry(org_id, id, function(err, _)
-					done_count = done_count + 1
-					if err then
-						failed_count = failed_count + 1
-						vim.notify("Failed to delete entry: " .. err, vim.log.levels.ERROR)
-					else
-						pending_deletes[id] = nil
-						for i, e in ipairs(entries) do
-							if e.id == id then
-								table.remove(entries, i)
-								break
-							end
-						end
-					end
-					if done_count == total then
-						local deleted = total - failed_count
-						if deleted > 0 then
-							vim.notify(
-								string.format("Deleted %d entr%s.", deleted, deleted == 1 and "y" or "ies"),
-								vim.log.levels.INFO
-							)
-						end
-						vim.bo[buf].modified = false
-						vim.schedule(function()
-							if vim.api.nvim_win_is_valid(win) then
-								redraw()
-								if #rows > 0 then
-									set_cursor_row(math.min(current_idx() or 1, #rows))
-								end
-							end
-						end)
-					end
-				end)
+			if search_query ~= "" then
+				search_query = ""
+				shell_redraw()
+				if #rows > 0 then
+					list_set_cursor(1)
+				end
 			end
-		end,
-	})
+		end, { buffer = buf, nowait = true, desc = "Clear search" })
+	end
+
+	shell_push({ render = render, install_keymaps = install_keymaps })
+	load_page(1)
+end
+
+--- Open the shell on a specific tab (by tab id string or index).
+---@param tab string|integer  tab id ("timer","status","projects","clients","tasks","entries") or 1-based index
+function M.open_tab(tab)
+	local tab_idx = 1
+	if type(tab) == "number" then
+		tab_idx = tab
+	elseif type(tab) == "string" then
+		for i, t in ipairs(TABS) do
+			if t.id == tab then
+				tab_idx = i
+				break
+			end
+		end
+	end
+	tab_idx = math.max(1, math.min(tab_idx, #TABS))
+
+	local was_open = shell_is_open()
+	shell_open(tab_idx)
+
+	if not was_open then
+		vim.api.nvim_win_set_config(shell.win, { title = " SolidTime ", title_pos = "center" })
+	end
+
+	shell.active_tab = tab_idx
+	shell.stack = {}
+	shell_resize_for_tab()
+	local tab_def = TABS[tab_idx]
+	if tab_def then
+		local launcher = M["_tab_" .. tab_def.id]
+		if launcher then
+			launcher()
+		end
+	end
+end
+
+function M.startScreen()
+	M.open_tab("timer")
+	shell.direct_open = true
+	timer_tab_open_start_form()
+end
+
+function M.editActiveEntry()
+	M.open_tab("timer")
+	shell.direct_open = true
+	timer_tab_open_edit_form()
+end
+
+function M.statusScreen()
+	M.open_tab("status")
+end
+function M.projectsScreen()
+	M.open_tab("projects")
+end
+function M.clientsScreen()
+	M.open_tab("clients")
+end
+function M.timeEntriesScreen()
+	M.open_tab("entries")
+end
+
+function M.tasksScreen(project_id, project_name)
+	local tab_idx = 5
+	local was_open = shell_is_open()
+	shell_open(tab_idx)
+	if not was_open then
+		vim.api.nvim_win_set_config(shell.win, { title = " SolidTime ", title_pos = "center" })
+	end
+	shell.active_tab = tab_idx
+	shell.stack = {}
+	shell_resize_for_tab()
+	M._tab_tasks(project_id, project_name)
 end
 
 return M

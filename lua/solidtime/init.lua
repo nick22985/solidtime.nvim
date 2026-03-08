@@ -86,30 +86,7 @@ function M.RegisterCommands()
 		elseif subcmd == "entries" then
 			buffer.timeEntriesScreen()
 		elseif subcmd == "tasks" then
-			local t_tracker = require("solidtime.tracker")
-			local t_api = require("solidtime.api")
-			local org_id = t_tracker.storage.current_information
-				and t_tracker.storage.current_information.organization_id
-			if not org_id then
-				vim.notify("No organization selected. Run :SolidTime open first.", vim.log.levels.WARN)
-				return
-			end
-			local proj_result = t_api.getOrganizationProjects(org_id)
-			if not proj_result or not proj_result.data or #proj_result.data == 0 then
-				vim.notify("No projects found.", vim.log.levels.WARN)
-				return
-			end
-			vim.ui.select(proj_result.data, {
-				prompt = "Select project for tasks:",
-				format_item = function(p)
-					return p.name
-				end,
-			}, function(selected)
-				if not selected then
-					return
-				end
-				buffer.tasksScreen(selected.id, selected.name)
-			end)
+			buffer.open_tab("tasks")
 		elseif subcmd == "status" then
 			buffer.statusScreen()
 		elseif subcmd == "reload" then

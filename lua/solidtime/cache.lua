@@ -42,6 +42,15 @@ function M.invalidate_cache(key)
 	logger.debug(string.format("Cache invalidated for key: %s", key))
 end
 
+function M.invalidate_cache_prefix(prefix)
+	logger.debug(string.format("Invalidating cache for prefix: %s", prefix))
+	for key in pairs(cache) do
+		if key:sub(1, #prefix) == prefix then
+			cache[key] = nil
+		end
+	end
+end
+
 function M.clear_all_cache()
 	logger.debug("Clearing all cache")
 	cache = {}
