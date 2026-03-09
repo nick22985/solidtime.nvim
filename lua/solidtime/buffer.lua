@@ -79,9 +79,9 @@ local function tab_bar_lines(inner_width)
 	local parts = {}
 	for i, tab in ipairs(TABS) do
 		if i == shell.active_tab then
-			table.insert(parts, " [" .. i .. ":" .. tab.label .. "] ")
+			table.insert(parts, " [" .. tab.label .. "] ")
 		else
-			table.insert(parts, "  " .. i .. ":" .. tab.label .. "  ")
+			table.insert(parts, "  " .. tab.label .. "  ")
 		end
 	end
 	local bar = table.concat(parts, "")
@@ -176,6 +176,24 @@ local function shell_open(tab_idx)
 	})
 	vim.keymap.set("n", "gg", function() end, { buffer = buf, nowait = true })
 	vim.keymap.set("n", "G", function() end, { buffer = buf, nowait = true })
+	vim.keymap.set("n", "<C-d>", function() end, { buffer = buf, nowait = true })
+	vim.keymap.set("n", "<C-u>", function() end, { buffer = buf, nowait = true })
+
+	vim.keymap.set("n", "<Tab>", function()
+		local next_tab = (shell.active_tab % #TABS) + 1
+		M.switch_tab(next_tab)
+	end, { buffer = buf, nowait = true, desc = "Next tab" })
+	vim.keymap.set("n", "<S-Tab>", function()
+		local prev_tab = ((shell.active_tab - 2) % #TABS) + 1
+		M.switch_tab(prev_tab)
+	end, { buffer = buf, nowait = true, desc = "Previous tab" })
+
+	for i = 1, #TABS do
+		local idx = i
+		vim.keymap.set("n", "<leader>" .. i, function()
+			M.switch_tab(idx)
+		end, { buffer = buf, nowait = true, desc = "Switch to tab " .. TABS[idx].label })
+	end
 
 	local function back_or_close()
 		if not shell.direct_open and #shell.stack > 1 then
@@ -194,13 +212,6 @@ local function shell_open(tab_idx)
 	shell_back_or_close_fn = back_or_close
 	bmap(buf, km().close, back_or_close, "Back / Close")
 	bmap(buf, km().close_alt, back_or_close, "Back / Close")
-
-	for i = 1, #TABS do
-		local idx = i
-		vim.keymap.set("n", tostring(i), function()
-			M.switch_tab(idx)
-		end, { buffer = buf, nowait = true, desc = "Switch to tab " .. TABS[idx].label })
-	end
 end
 
 function shell_resize_for_tab()
@@ -490,6 +501,14 @@ local function open_form(fields, title, on_confirm)
 			cursor_idx = #nav
 			set_cursor(nav)
 		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			cursor_idx = math.min(#nav, cursor_idx + math.max(1, math.floor(#nav / 2)))
+			set_cursor(nav)
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			cursor_idx = math.max(1, cursor_idx - math.max(1, math.floor(#nav / 2)))
+			set_cursor(nav)
+		end, { buffer = buf, nowait = true })
 	end
 
 	local view = {
@@ -555,6 +574,14 @@ local function shell_select(items, opts, on_choice)
 			if #rows > 0 then
 				list_set_cursor(#rows)
 			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
 		end, { buffer = buf, nowait = true })
 
 		bmap(buf, km().confirm, function()
@@ -1257,6 +1284,8 @@ local function timer_tab_open_start_form()
 				billable = vals.billable,
 				tags = vals.tags,
 			})
+			shell.stack = {}
+			M._tab_timer()
 		end)
 	end
 
@@ -1436,7 +1465,7 @@ function M._tab_timer()
 			table.insert(lines, lbl .. "○ Stopped")
 			table.insert(lines, string.rep("─", inner_w))
 			table.insert(lines, "")
-			table.insert(lines, "  s start   1-6 switch tab   q close")
+			table.insert(lines, "  s start   <Tab>/<S-Tab> cycle   <leader>1-6 jump   q close")
 			return lines
 		end
 		local function install_keymaps()
@@ -2202,6 +2231,14 @@ function M._tab_projects()
 				list_set_cursor(#rows)
 			end
 		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
 
 		bmap(buf, km().confirm, function()
 			local idx = list_current_idx(rows)
@@ -2429,6 +2466,14 @@ function M._tab_clients()
 			if #rows > 0 then
 				list_set_cursor(#rows)
 			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
 		end, { buffer = buf, nowait = true })
 
 		bmap(buf, km().add, function()
@@ -2682,15 +2727,24 @@ function M._tab_tasks(project_id, project_name)
 				end
 			end, "Previous project")
 			vim.keymap.set("n", "gg", function()
-				if #picker_rows > 0 then
+				if #rows > 0 then
 					list_set_cursor(1)
 				end
 			end, { buffer = buf, nowait = true })
 			vim.keymap.set("n", "G", function()
-				if #picker_rows > 0 then
-					list_set_cursor(#picker_rows)
+				if #rows > 0 then
+					list_set_cursor(#rows)
 				end
 			end, { buffer = buf, nowait = true })
+			vim.keymap.set("n", "<C-d>", function()
+				local idx = list_current_idx(rows) or 1
+				list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+			end, { buffer = buf, nowait = true })
+			vim.keymap.set("n", "<C-u>", function()
+				local idx = list_current_idx(rows) or 1
+				list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
+			end, { buffer = buf, nowait = true })
+
 			bmap(buf, km().confirm, function()
 				local idx = list_current_idx(picker_rows)
 				if not idx then
@@ -2852,6 +2906,14 @@ function M._tab_tasks(project_id, project_name)
 			if #rows > 0 then
 				list_set_cursor(#rows)
 			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
 		end, { buffer = buf, nowait = true })
 
 		bmap(buf, km().add, function()
@@ -3367,6 +3429,14 @@ function M._tab_entries()
 			if #rows > 0 then
 				list_set_cursor(#rows)
 			end
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-d>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.min(#rows, idx + math.max(1, math.floor(#rows / 2))))
+		end, { buffer = buf, nowait = true })
+		vim.keymap.set("n", "<C-u>", function()
+			local idx = list_current_idx(rows) or 1
+			list_set_cursor(math.max(1, idx - math.max(1, math.floor(#rows / 2))))
 		end, { buffer = buf, nowait = true })
 
 		bmap(buf, km().next_page, function()

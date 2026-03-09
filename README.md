@@ -44,15 +44,27 @@ Open the plugin with `<leader>so` (or `:SolidTime open`). This opens the floatin
 
 ### Navigation
 
-The shell has six tabs. Press the number key shown in the tab bar to jump directly to that tab:
+The shell has six tabs shown at the top of the floating window:
 
 ```
- [1:Timer]   2:Status   3:Projects   4:Clients   5:Tasks   6:Entries
+ [Timer]   Status   Projects   Clients   Tasks   Entries
 ```
+
+#### Switching tabs
+
+| Key                   | Action                                    |
+| --------------------- | ----------------------------------------- |
+| `<Tab>`               | Cycle to the next tab                     |
+| `<S-Tab>`             | Cycle to the previous tab                 |
+| `<leader>1`–`<leader>6` | Jump directly to tab 1–6 (Timer → Entries) |
+
+> **Note:** bare number keys (`1`–`6`) are intentionally **not** bound inside the shell so
+> they remain available for Vim count motions (e.g. `5j`, `3k`).
+
+#### Within a tab
 
 | Key           | Action                          |
 | ------------- | ------------------------------- |
-| `1`–`6`       | Switch to that tab              |
 | `j` / `k`     | Move cursor down / up           |
 | `<CR>`        | Confirm / edit highlighted item |
 | `a`           | Add / create new item           |
@@ -153,7 +165,7 @@ Auto-tracking starts and stops timers automatically based on which git repositor
 ### Setup
 
 1. Open the plugin with `<leader>so`.
-2. Switch to the **Projects** tab (`3`) and register the desired project, **or** edit `~/.config/solidtime/projects.json` manually:
+2. Switch to the **Projects** tab (`<Tab>` or `<leader>3`) and register the desired project, **or** edit `~/.config/solidtime/projects.json` manually:
 
 ```json
 {

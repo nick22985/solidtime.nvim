@@ -28,13 +28,15 @@ local function read_registry()
 		return {}
 	end
 	-- Migrate plain-string entries from older format to table entries.
+	-- Drop any entry whose socket field is not a non-empty string.
 	local migrated = {}
 	for _, entry in ipairs(decoded) do
-		if type(entry) == "string" then
+		if type(entry) == "string" and entry ~= "" then
 			table.insert(migrated, { socket = entry, project_dir = nil })
-		else
+		elseif type(entry) == "table" and type(entry.socket) == "string" and entry.socket ~= "" then
 			table.insert(migrated, entry)
 		end
+		-- silently drop anything else (nil socket, table-as-socket, etc.)
 	end
 	return migrated
 end
@@ -57,6 +59,9 @@ end
 ---@param socket_path string
 ---@return boolean
 local function is_socket_alive(socket_path)
+	if type(socket_path) ~= "string" or socket_path == "" then
+		return false
+	end
 	if socket_path == own_socket() then
 		return false
 	end
@@ -111,24 +116,27 @@ local function live_peers()
 end
 
 --- Returns true when at least one other live Neovim instance is registered
---- with the same project_dir as this instance.
----@param project_dir string
+--- for the same solidtime project name as this instance.
+--- Matches on project_name (the resolved git/cwd name used in projects.json)
+--- so that different worktrees of the same repo are treated as peers.
+---@param project_name string
 ---@return boolean
-function M.has_peer_in_project(project_dir)
-	if not project_dir or project_dir == "" then
+function M.has_peer_for_project(project_name)
+	if not project_name or project_name == "" then
 		return false
 	end
 	local entries = live_entries()
 	local me = own_socket()
 	for _, entry in ipairs(entries) do
-		if entry.socket ~= me and entry.project_dir == project_dir then
+		if entry.socket ~= me and entry.project_name == project_name then
 			return true
 		end
 	end
 	return false
 end
 
-function M.register()
+---@param project_name string|nil  resolved project name (from autotrack.detect_project())
+function M.register(project_name)
 	local me = own_socket()
 	if not me then
 		return
@@ -141,11 +149,12 @@ function M.register()
 	for _, entry in ipairs(all) do
 		if entry.socket == me then
 			entry.project_dir = project_dir
+			entry.project_name = project_name or entry.project_name
 			write_registry(all)
 			return
 		end
 	end
-	table.insert(all, { socket = me, project_dir = project_dir })
+	table.insert(all, { socket = me, project_dir = project_dir, project_name = project_name })
 	write_registry(all)
 end
 

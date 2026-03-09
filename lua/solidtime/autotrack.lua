@@ -173,10 +173,26 @@ end
 ---@return string|nil
 local function detect_project_for_path(file_path)
 	local dir = file_path and vim.fn.fnamemodify(file_path, ":h") or vim.fn.getcwd()
+	local escaped = vim.fn.shellescape(dir)
 
-	local git_root =
-		vim.fn.systemlist("git -C " .. vim.fn.shellescape(dir) .. " rev-parse --show-toplevel 2>/dev/null")[1]
+	local git_root = vim.fn.systemlist("git -C " .. escaped .. " rev-parse --show-toplevel 2>/dev/null")[1]
 	if git_root and git_root ~= "" and not git_root:match("^fatal") then
+		local common_dir = vim.fn.systemlist("git -C " .. escaped .. " rev-parse --git-common-dir 2>/dev/null")[1]
+		if common_dir and common_dir ~= "" and not common_dir:match("^fatal") then
+			if not common_dir:match("^/") then
+				common_dir = dir .. "/" .. common_dir
+			end
+			common_dir = vim.fn.fnamemodify(common_dir, ":p"):gsub("/+$", "")
+			local repo_root
+			if common_dir:match("[/\\]%.git$") then
+				repo_root = vim.fn.fnamemodify(common_dir, ":h")
+			else
+				repo_root = common_dir
+			end
+			if repo_root and repo_root ~= "" and repo_root ~= "." then
+				return vim.fn.fnamemodify(repo_root, ":t")
+			end
+		end
 		return vim.fn.fnamemodify(git_root, ":t")
 	end
 
@@ -349,58 +365,76 @@ local function handle_project(project_name, opts)
 		return
 	end
 
-	local function do_stop_and_start()
-		ipc.broadcast_stop()
-		if tracker.storage.active_entry then
-			tracker.stop({ pause_autotrack = false })
-		end
+	local function apply_ci(ci)
+		ci.project_id = project_cfg.solidtime_project_id
+		ci.task_id = project_cfg.last_task_id or nil
+		ci.description = project_cfg.last_description or project_cfg.default_description or nil
+		ci.billable = (project_cfg.last_billable ~= nil) and project_cfg.last_billable
+			or (project_cfg.default_billable or false)
+		ci.tags = (project_cfg.last_tags and #project_cfg.last_tags > 0) and project_cfg.last_tags
+			or (project_cfg.default_tags and #project_cfg.default_tags > 0) and project_cfg.default_tags
+			or nil
+	end
 
-		if project_cfg and project_cfg.auto_start and project_cfg.solidtime_project_id then
-			local ci = tracker.storage.current_information
-
-			if not ci or not ci.organization_id then
-				if project_cfg.organization_id and project_cfg.member_id then
-					tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
-					ci = tracker.storage.current_information
-				else
-					logger.warn(
-						"solidtime autotrack: no current_information and no org in project config — cannot auto-start (run :SolidTime open first)"
-					)
-					return
-				end
-			end
-
-			ci.project_id = project_cfg.solidtime_project_id
-			ci.task_id = project_cfg.last_task_id or nil
-			ci.description = project_cfg.last_description or project_cfg.default_description or nil
-			ci.billable = (project_cfg.last_billable ~= nil) and project_cfg.last_billable
-				or (project_cfg.default_billable or false)
-			ci.tags = (project_cfg.last_tags and #project_cfg.last_tags > 0) and project_cfg.last_tags
-				or (project_cfg.default_tags and #project_cfg.default_tags > 0) and project_cfg.default_tags
-				or nil
-
-			tracker.start()
-			local notify_delay = startup and ((config.get().autotrack or {}).startup_notify_delay or 100) or 0
-			if notify_delay > 0 then
-				vim.defer_fn(function()
-					notify_auto_started(project_name, project_cfg)
-				end, notify_delay)
+	local function ensure_ci()
+		local ci = tracker.storage.current_information
+		if not ci or not ci.organization_id then
+			if project_cfg.organization_id and project_cfg.member_id then
+				tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
+				ci = tracker.storage.current_information
 			else
+				logger.warn(
+					"solidtime autotrack: no current_information and no org in project config — cannot auto-start (run :SolidTime open first)"
+				)
+				return nil
+			end
+		end
+		return ci
+	end
+
+	local function do_start(ci)
+		tracker.start()
+		local notify_delay = startup and ((config.get().autotrack or {}).startup_notify_delay or 100) or 0
+		if notify_delay > 0 then
+			vim.defer_fn(function()
 				notify_auto_started(project_name, project_cfg)
-			end
-			reset_idle_timers()
-			if ci.task_id then
-				async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
-			end
+			end, notify_delay)
+		else
+			notify_auto_started(project_name, project_cfg)
+		end
+		reset_idle_timers()
+		if ci.task_id then
+			async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
 		end
 	end
 
-	local should_try_adopt = project_cfg
-		and project_cfg.auto_start
-		and project_cfg.solidtime_project_id
-		and not tracker.storage.active_entry
+	local function do_adopt(existing_entry)
+		logger.info("solidtime autotrack: adopting existing server entry for " .. project_name)
+		tracker.storage.active_entry = existing_entry
+		tracker.storage.active_entry.tracking_type = "online"
+		local ci = tracker.storage.current_information
+		if not ci or not ci.organization_id then
+			if project_cfg.organization_id and project_cfg.member_id then
+				tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
+				ci = tracker.storage.current_information
+			end
+		end
+		if ci then
+			apply_ci(ci)
+		end
+		reset_idle_timers()
+		local adopted_task_id = ci and ci.task_id
+		if adopted_task_id then
+			async_check_task_done(
+				project_name,
+				project_cfg.organization_id or (ci and ci.organization_id),
+				project_cfg.solidtime_project_id,
+				adopted_task_id
+			)
+		end
+	end
 
-	if should_try_adopt then
+	if project_cfg and project_cfg.auto_start and project_cfg.solidtime_project_id then
 		local api = require("solidtime.api")
 		api.getUserTimeEntry(function(err, existing)
 			if
@@ -409,42 +443,34 @@ local function handle_project(project_name, opts)
 				and existing.data
 				and existing.data.project_id == project_cfg.solidtime_project_id
 			then
-				logger.info("solidtime autotrack: adopting existing server entry for " .. project_name)
-				tracker.storage.active_entry = existing.data
-				tracker.storage.active_entry.tracking_type = "online"
-				local ci = tracker.storage.current_information
-				if not ci or not ci.organization_id then
-					if project_cfg.organization_id and project_cfg.member_id then
-						tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
-						ci = tracker.storage.current_information
-					end
+				local local_entry = tracker.storage.active_entry
+				if local_entry and local_entry.id ~= existing.data.id then
+					ipc.broadcast_stop()
+					tracker.stop({ pause_autotrack = false })
 				end
-				if ci then
-					ci.project_id = project_cfg.solidtime_project_id
-					ci.task_id = project_cfg.last_task_id or nil
-					ci.description = project_cfg.last_description or project_cfg.default_description or nil
-					ci.billable = (project_cfg.last_billable ~= nil) and project_cfg.last_billable
-						or (project_cfg.default_billable or false)
-					ci.tags = (project_cfg.last_tags and #project_cfg.last_tags > 0) and project_cfg.last_tags
-						or (project_cfg.default_tags and #project_cfg.default_tags > 0) and project_cfg.default_tags
-						or nil
-				end
-				reset_idle_timers()
-				local adopted_task_id = ci and ci.task_id
-				if adopted_task_id then
-					async_check_task_done(
-						project_name,
-						project_cfg.organization_id or (ci and ci.organization_id),
-						project_cfg.solidtime_project_id,
-						adopted_task_id
-					)
-				end
+				do_adopt(existing.data)
 				return
 			end
-			do_stop_and_start()
+
+			ipc.broadcast_stop()
+			if tracker.storage.active_entry then
+				tracker.stop({ pause_autotrack = false })
+			end
+
+			if project_cfg.solidtime_project_id then
+				local ci = ensure_ci()
+				if not ci then
+					return
+				end
+				apply_ci(ci)
+				do_start(ci)
+			end
 		end)
 	else
-		do_stop_and_start()
+		ipc.broadcast_stop()
+		if tracker.storage.active_entry then
+			tracker.stop({ pause_autotrack = false })
+		end
 	end
 end
 
@@ -454,6 +480,7 @@ function M.on_project_change(opts)
 		if not project_name then
 			return
 		end
+		ipc.register(project_name)
 		handle_project(project_name, opts)
 	end)
 end
@@ -471,6 +498,8 @@ function M.on_focus_gained()
 		if not project_name then
 			return
 		end
+
+		ipc.register(project_name)
 
 		if project_name == last_project_name and tracker.storage.active_entry then
 			M.on_activity()
@@ -493,6 +522,7 @@ function M.on_buf_enter(bufnr)
 		if not project_name then
 			return
 		end
+		ipc.register(project_name)
 		handle_project(project_name)
 	end)
 end
@@ -711,11 +741,11 @@ function M.init()
 			if not tracker.storage.active_entry then
 				return
 			end
-			local project_dir = vim.fn.getcwd()
-			if ipc.has_peer_in_project(project_dir) then
+			local project_name = M.detect_project()
+			if project_name and ipc.has_peer_for_project(project_name) then
 				logger.info(
-					"solidtime autotrack: exit — another nvim is open in '"
-						.. project_dir
+					"solidtime autotrack: exit — another nvim is open for '"
+						.. project_name
 						.. "', leaving timer running"
 				)
 				return
