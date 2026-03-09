@@ -8,6 +8,7 @@ A Neovim plugin for [Solidtime](https://www.solidtime.io/) — start, stop, and 
 - Single persistent floating window with a tabbed interface — no stacking popups
 - Edit the active time entry (project, task, description, billable, tags) inline
 - Browse and manage projects, clients, tasks, and time entries in a unified shell
+- **Tickets** — search Freedcamp issues or Planka cards, link them to Solidtime tasks, and start timers directly from ticket results
 - **Auto-tracking** — automatically starts/stops timers when you switch git projects
 - **Idle detection** — warns and optionally stops the timer after configurable periods of inactivity
 - **IPC** — broadcasts stop events to other Neovim instances so only one timer runs at a time
@@ -44,19 +45,19 @@ Open the plugin with `<leader>so` (or `:SolidTime open`). This opens the floatin
 
 ### Navigation
 
-The shell has six tabs shown at the top of the floating window:
+The shell has seven tabs shown at the top of the floating window:
 
 ```
- [Timer]   Status   Projects   Clients   Tasks   Entries
+ [Timer]   Status   Projects   Clients   Tasks   Entries   Tickets
 ```
 
 #### Switching tabs
 
-| Key                   | Action                                    |
-| --------------------- | ----------------------------------------- |
-| `<Tab>`               | Cycle to the next tab                     |
-| `<S-Tab>`             | Cycle to the previous tab                 |
-| `<leader>1`–`<leader>6` | Jump directly to tab 1–6 (Timer → Entries) |
+| Key                      | Action                                           |
+| ------------------------ | ------------------------------------------------ |
+| `<Tab>`                  | Cycle to the next tab                            |
+| `<S-Tab>`                | Cycle to the previous tab                        |
+| `<leader>1`–`<leader>7`  | Jump directly to tab 1–7 (Timer → Tickets)       |
 
 > **Note:** bare number keys (`1`–`6`) are intentionally **not** bound inside the shell so
 > they remain available for Vim count motions (e.g. `5j`, `3k`).
@@ -77,13 +78,97 @@ When a timer is **running** the tab opens an edit form directly showing elapsed 
 
 When **stopped**, press `s` to start a new entry.
 
+### Entries tab
+
+Paginated history of your time entries. Use `[` / `]` to page through results.
+
+To **bulk-delete** entries:
+
+1. Press `d` on individual entries (or visual-select a range and press `d`) to stage them for deletion. Staged entries are marked visually.
+2. Press `:w` to commit the deletion. All staged entries are sent to the API and removed from the list.
+
+### Tickets tab
+
+The Tickets tab lets you search for tickets from external issue trackers and act on them without leaving Neovim.
+
+#### Supported providers
+
+| Provider    | What is searched              |
+| ----------- | ----------------------------- |
+| Freedcamp   | Issues across your projects   |
+| Planka      | Cards across boards/projects  |
+
+#### Setup
+
+Configure providers in your `setup()` call:
+
+```lua
+require("solidtime").setup({
+    tickets = {
+        providers = {
+            freedcamp = {
+                api_key    = "your-freedcamp-api-key",
+                api_secret = "your-freedcamp-api-secret",
+            },
+            planka = {
+                base_url = "https://planka.example.com",
+                username = "you@example.com",
+                password = "yourpassword",
+            },
+        },
+    },
+})
+```
+
+Alternatively, run `:SolidTime auth freedcamp` or `:SolidTime auth planka` to enter credentials interactively. They are stored in `~/.solidtime_api_config` and never hard-coded in your config.
+
+#### Linking a project
+
+The first time you open the Tickets tab for a project, press `p` to pick and link a ticket provider project (or Planka board). The choice is saved to `projects.json` and remembered for that git repo.
+
+#### Keymaps (Tickets tab)
+
+| Key          | Action                                                      |
+| ------------ | ----------------------------------------------------------- |
+| `/`          | Enter search mode — type a query, press `<Esc>` to run it  |
+| `<CR>`       | Load all tickets (when no results yet), or open action menu |
+| `o`          | Open the selected ticket in the browser                     |
+| `j` / `k`    | Move between ticket results                                 |
+| `gg` / `G`   | Jump to first / last ticket                                 |
+| `<C-d>` / `<C-u>` | Scroll half-page down / up                           |
+| `p`          | Pick / change linked project or board                       |
+| `<leader>g`  | Toggle global search (search all projects, not just linked) |
+| `<Esc>`      | Clear search query; second press exits global mode          |
+| `q`          | Close the shell                                             |
+
+#### Action menu (`<CR>` on a ticket)
+
+| Option                      | Description                                         |
+| --------------------------- | --------------------------------------------------- |
+| Open in browser             | Open the ticket URL in your system browser          |
+| Create Solidtime task       | Create a task in the linked Solidtime project       |
+| Start timer with this title | Start a timer using the ticket title as description |
+| Create task and start timer | Both of the above in one step                       |
+
+#### Ticket display
+
+Each result row shows the ticket title followed by badge tags:
+
+```
+  Fix login crash  [MyProject][Dev Board][In Progress]
+```
+
+- **Project** — shown in global search so you know where the card lives
+- **Board** — the Planka board (or Freedcamp project) the ticket belongs to
+- **Status** — the list/column name (Planka) or status title (Freedcamp)
+- **Priority** — label names if present
+
 ### Other tabs
 
 - **Status** — quick summary of the currently running entry
 - **Projects** — create, rename, delete projects; press `t` on a project to open its tasks
 - **Clients** — create, rename, delete clients
 - **Tasks** — manage tasks across projects; press `<CR>` to toggle done, `r` to rename
-- **Entries** — paginated time entry history (`[` / `]` to page)
 
 All list pickers, confirmations, and text inputs stay inside the floating shell — no external popups.
 
@@ -115,6 +200,21 @@ require("solidtime").setup({
         -- Delay (ms) before showing the startup auto-start notification.
         -- Increase if your notification plugin (noice, nvim-notify, etc.) loads slowly.
         startup_notify_delay = 100,
+    },
+
+    -- External ticket providers (Freedcamp, Planka, …).
+    tickets = {
+        providers = {
+            freedcamp = {
+                api_key    = "...",
+                api_secret = "...",
+            },
+            planka = {
+                base_url = "https://planka.example.com",
+                username = "...",
+                password = "...",
+            },
+        },
     },
 
     -- Keymaps. Set any value to false to disable that mapping.
@@ -154,6 +254,7 @@ require("solidtime").setup({
 | `:SolidTime clients`   | Open the shell on the Clients tab                 |
 | `:SolidTime tasks`     | Open the shell on the Tasks tab                   |
 | `:SolidTime entries`   | Open the shell on the Entries tab                 |
+| `:SolidTime tickets`   | Open the shell on the Tickets tab                 |
 | `:SolidTime status`    | Open the shell on the Status tab                  |
 | `:SolidTime reload`    | Hot-reload the plugin                             |
 | `:SolidTime unproject` | Remove the current git project from auto-tracking |
@@ -194,3 +295,4 @@ When a timer is running, activity events (`CursorMoved`, `InsertEnter`, `BufWrit
 ## API Reference
 
 - [Solidtime API docs](https://docs.solidtime.io/api-reference)
+
