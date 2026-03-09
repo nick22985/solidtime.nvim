@@ -132,6 +132,141 @@ function M.get_api_key_for_url(url)
 	return nil
 end
 
+--- Return all stored credentials for a provider as a flat table, e.g.
+---   { api_key = "xxx", api_secret = "yyy" }
+--- Returns an empty table when nothing is stored yet.
+---@param provider_id string
+---@return table<string, string>
+function M.get_provider_creds(provider_id)
+	local prefix = "provider." .. provider_id .. "."
+	local creds = {}
+	for _, line in ipairs(read_lines()) do
+		if line:sub(1, #prefix) == prefix then
+			local rest = line:sub(#prefix + 1)
+			local eq = rest:find("=")
+			if eq then
+				local field = rest:sub(1, eq - 1)
+				local value = rest:sub(eq + 1)
+				creds[field] = value
+			end
+		end
+	end
+	return creds
+end
+
+--- Persist one credential field for a provider, overwriting any existing value.
+---@param provider_id string
+---@param field string   e.g. "api_key"
+---@param value string
+function M.set_provider_cred(provider_id, field, value)
+	local key_line = "provider." .. provider_id .. "." .. field .. "=" .. value
+	local pattern = "^provider%." .. provider_id:gsub("%-", "%%-") .. "%." .. field .. "="
+	local lines = read_lines()
+	local found = false
+	for i, line in ipairs(lines) do
+		if line:match(pattern) then
+			lines[i] = key_line
+			found = true
+			break
+		end
+	end
+	if not found then
+		table.insert(lines, key_line)
+	end
+	write_lines(lines)
+end
+
+--- Return a deduplicated list of provider IDs that have any stored credentials.
+--- E.g. if the file contains "provider.freedcamp.api_key=…" this returns {"freedcamp"}.
+---@return string[]
+function M.list_provider_ids()
+	local seen = {}
+	local ids = {}
+	for _, line in ipairs(read_lines()) do
+		local id = line:match("^provider%.([^%.]+)%.")
+		if id and not seen[id] then
+			seen[id] = true
+			table.insert(ids, id)
+		end
+	end
+	return ids
+end
+
+---@param provider_id string
+function M.clear_provider_creds(provider_id)
+	local prefix = "provider." .. provider_id .. "."
+	local lines = read_lines()
+	local out = {}
+	for _, line in ipairs(lines) do
+		if line:sub(1, #prefix) ~= prefix then
+			table.insert(out, line)
+		end
+	end
+	write_lines(out)
+end
+
+--- Interactive prompt to set credentials for a ticket provider.
+---
+--- `provider` must expose:
+---   provider.id             string
+---   provider.name           string
+---   provider.credential_fields  table[]  -- ordered list of { key, label, secret? }
+---     key    — the credential key stored in the auth file (e.g. "api_key")
+---     label  — shown in the prompt (e.g. "API Key")
+---     secret — (optional) if true, mask the default value with "****"
+---
+--- After all fields are collected the provider's `setup()` is called with the
+--- new credentials so the change takes effect immediately without a reload.
+---@param provider table
+function M.prompt_provider_credentials(provider)
+	local fields = provider.credential_fields
+	if not fields or #fields == 0 then
+		print(provider.name .. ": no credential fields defined")
+		return
+	end
+
+	local existing = M.get_provider_creds(provider.id)
+	local collected = {}
+
+	local function save_all()
+		for k, v in pairs(collected) do
+			M.set_provider_cred(provider.id, k, v)
+		end
+		local final = M.get_provider_creds(provider.id)
+		if provider.setup then
+			provider.setup(final)
+		end
+		print(provider.name .. " credentials saved.")
+	end
+
+	local function prompt_field(idx)
+		if idx > #fields then
+			save_all()
+			return
+		end
+		local fd = fields[idx]
+		local current = existing[fd.key]
+		local default_shown = (fd.secret and current and current ~= "") and "****" or (current or "")
+		vim.ui.input({
+			prompt = provider.name .. " " .. fd.label .. ": ",
+			default = default_shown,
+		}, function(val)
+			if val == nil then
+				print(provider.name .. " auth not changed.")
+				return
+			end
+			val = val:match("^%s*(.-)%s*$")
+			if val == "" or (fd.secret and val == "****") then
+			else
+				collected[fd.key] = val
+			end
+			prompt_field(idx + 1)
+		end)
+	end
+
+	prompt_field(1)
+end
+
 --- Normalise a raw URL string entered by the user:
 --- strips whitespace, trailing slash, and appends /api/v1 if absent.
 local function normalise_url(raw)

@@ -741,11 +741,21 @@ function M.init()
 			if not tracker.storage.active_entry then
 				return
 			end
-			local project_name = M.detect_project()
-			if project_name and ipc.has_peer_for_project(project_name) then
+			local current_project = M.detect_project()
+			if current_project ~= last_project_name then
+				logger.info(
+					"solidtime autotrack: exit — current project '"
+						.. (current_project or "?")
+						.. "' is not the tracked project '"
+						.. (last_project_name or "?")
+						.. "', leaving timer running"
+				)
+				return
+			end
+			if current_project and ipc.has_peer_for_project(current_project) then
 				logger.info(
 					"solidtime autotrack: exit — another nvim is open for '"
-						.. project_name
+						.. current_project
 						.. "', leaving timer running"
 				)
 				return

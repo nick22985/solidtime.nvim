@@ -85,15 +85,12 @@ local function parse_response(response, endpoint, cache_key, ttl)
 			logger.debug(string.format("Caching response for key: %s", cache_key))
 		end
 		return nil, decoded
-
 	elseif response.status == 204 then
 		return nil, {}
-
 	elseif response.status == 401 then
 		local error_message = "Unauthorized — check your API key (`:SolidTime auth`)"
 		logger.error(error_message)
 		return "API Error: 401 " .. error_message, nil
-
 	else
 		local error_message = "Unknown error"
 		if response.body and response.body ~= "" then
@@ -105,7 +102,12 @@ local function parse_response(response, endpoint, cache_key, ttl)
 			end
 		end
 		logger.error(
-			string.format("Error response: %d for URL: %s Response: %s", response.status, endpoint, vim.inspect(response)),
+			string.format(
+				"Error response: %d for URL: %s Response: %s",
+				response.status,
+				endpoint,
+				vim.inspect(response)
+			),
 			false
 		)
 		return "API Error: " .. response.status .. " " .. error_message, nil
@@ -169,7 +171,7 @@ function M.get_data(endpoint, method, params, data, callback, ttl)
 
 	local options = {
 		headers = headers,
-		-- plenary.curl fires the callback on the main loop via vim.schedule
+		raw = { "--location-trusted" },
 		callback = vim.schedule_wrap(function(response)
 			local err, decoded = parse_response(response, endpoint, cache_key, ttl)
 			callback(err, decoded)
