@@ -28,6 +28,8 @@ local TABS = {
 
 local shell_back_or_close_fn = nil
 
+local _timer_bg_sync = nil
+
 local shell = {
 	win = nil,
 	buf = nil,
@@ -55,6 +57,10 @@ local function shell_close()
 	shell.stack = {}
 	shell.direct_open = false
 	shell_back_or_close_fn = nil
+	if _timer_bg_sync then
+		vim.fn.timer_stop(_timer_bg_sync)
+		_timer_bg_sync = nil
+	end
 end
 
 local DEFAULT_W = 90
@@ -174,6 +180,10 @@ local function shell_open(tab_idx)
 			shell.buf = nil
 			shell.stack = {}
 			shell.direct_open = false
+			if _timer_bg_sync then
+				vim.fn.timer_stop(_timer_bg_sync)
+				_timer_bg_sync = nil
+			end
 		end,
 	})
 	vim.keymap.set("n", "gg", function() end, { buffer = buf, nowait = true })
@@ -1714,18 +1724,157 @@ function M._tab_timer(opts)
 		table.insert(fields, { key = "__sep__", label = "" })
 		table.insert(fields, { key = "__action__", label = "✎  Save" })
 
+		local field_by_key = {}
+		for _, f in ipairs(fields) do
+			field_by_key[f.key] = f
+		end
+
+		local function apply_remote_entry(remote)
+			if not remote then
+				return
+			end
+			local changed = false
+
+			local function sync_field(key, remote_val)
+				if entry[key] ~= remote_val then
+					entry[key] = remote_val
+					if tracker.storage.active_entry then
+						tracker.storage.active_entry[key] = remote_val
+					end
+					local ff = field_by_key[key]
+					if ff then
+						ff.value = remote_val
+					end
+					changed = true
+				end
+			end
+
+			sync_field("description", remote.description)
+			sync_field("start", remote.start)
+			sync_field("billable", remote.billable)
+			sync_field("project_id", remote.project_id)
+			sync_field("task_id", remote.task_id)
+
+			local function tags_key(t)
+				if type(t) ~= "table" then
+					return ""
+				end
+				local ids = {}
+				for _, tag in ipairs(t) do
+					table.insert(ids, type(tag) == "table" and (tag.id or tostring(tag)) or tostring(tag))
+				end
+				table.sort(ids)
+				return table.concat(ids, ",")
+			end
+			if tags_key(entry.tags) ~= tags_key(remote.tags) then
+				entry.tags = remote.tags
+				if tracker.storage.active_entry then
+					tracker.storage.active_entry.tags = remote.tags
+				end
+				local ff = field_by_key["tags"]
+				if ff then
+					ff.value = remote.tags
+				end
+				changed = true
+			end
+
+			if changed then
+				local mode = vim.api.nvim_get_mode().mode
+				if mode ~= "i" and mode ~= "R" then
+					shell_redraw()
+				end
+			end
+		end
+
+		if _timer_bg_sync then
+			vim.fn.timer_stop(_timer_bg_sync)
+			_timer_bg_sync = nil
+		end
+		_timer_bg_sync = vim.fn.timer_start(30000, function()
+			vim.schedule(function()
+				if not shell_is_open() then
+					if _timer_bg_sync then
+						vim.fn.timer_stop(_timer_bg_sync)
+						_timer_bg_sync = nil
+					end
+					return
+				end
+				api.getUserTimeEntry(function(err, result)
+					if err or not result then
+						return
+					end
+					vim.schedule(function()
+						if not shell_is_open() then
+							return
+						end
+						apply_remote_entry(result.data)
+					end)
+				end)
+			end)
+		end, { ["repeat"] = -1 })
+
 		open_form(fields, "Timer", function(f)
+			if _timer_bg_sync then
+				vim.fn.timer_stop(_timer_bg_sync)
+				_timer_bg_sync = nil
+			end
 			local vals = fields_to_vals(f)
-			finalize_edit(vals.description, vals.billable, vals.tags, vals.project, vals.task)
-			shell.stack = {}
-			M._tab_timer()
+
+			api.getUserTimeEntry(function(fetch_err, fetch_result)
+				vim.schedule(function()
+					if fetch_result and fetch_result.data then
+						local remote = fetch_result.data
+						if remote.start then
+							entry.start = remote.start
+						end
+						if remote.id then
+							entry.id = remote.id
+						end
+						if remote.member_id then
+							entry.member_id = remote.member_id
+						end
+						if tracker.storage.active_entry then
+							if remote.start then
+								tracker.storage.active_entry.start = remote.start
+							end
+							if remote.id then
+								tracker.storage.active_entry.id = remote.id
+							end
+							if remote.member_id then
+								tracker.storage.active_entry.member_id = remote.member_id
+							end
+						end
+					end
+					finalize_edit(vals.description, vals.billable, vals.tags, vals.project, vals.task)
+					shell.stack = {}
+					M._tab_timer()
+				end)
+			end)
 		end)
+
+		local top = shell.stack[#shell.stack]
+		if top then
+			local orig_on_pop = top.on_pop
+			top.on_pop = function()
+				if _timer_bg_sync then
+					vim.fn.timer_stop(_timer_bg_sync)
+					_timer_bg_sync = nil
+				end
+				if orig_on_pop then
+					orig_on_pop()
+				end
+			end
+		end
 
 		vim.schedule(function()
 			if not shell_is_open() then
 				return
 			end
 			vim.keymap.set("n", "s", function()
+				if _timer_bg_sync then
+					vim.fn.timer_stop(_timer_bg_sync)
+					_timer_bg_sync = nil
+				end
 				tracker.stop()
 				shell.stack = {}
 				M._tab_timer()

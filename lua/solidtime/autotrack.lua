@@ -494,7 +494,7 @@ function M.on_focus_gained()
 			return
 		end
 
-		local project_name = M.detect_project_for_buf(bufnr) or M.detect_project()
+		local project_name = M.detect_project()
 		if not project_name then
 			return
 		end
@@ -518,7 +518,7 @@ function M.on_buf_enter(bufnr)
 			M.on_activity()
 			return
 		end
-		local project_name = M.detect_project_for_buf(bufnr)
+		local project_name = M.detect_project()
 		if not project_name then
 			return
 		end
