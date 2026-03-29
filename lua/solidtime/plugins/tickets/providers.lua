@@ -1,4 +1,4 @@
---- solidtime.tickets — provider registry and shared HTTP helper.
+--- solidtime.plugins.tickets.providers — provider registry and shared HTTP helper.
 ---
 --- Each provider (Freedcamp, Planka, Trello, …) is a Lua module that calls
 --- M.register() when it is loaded.  The rest of the plugin only talks to

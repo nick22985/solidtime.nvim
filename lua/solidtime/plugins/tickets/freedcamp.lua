@@ -1,4 +1,4 @@
---- solidtime.tickets.freedcamp — Freedcamp ticket provider.
+--- solidtime.plugins.tickets.freedcamp — Freedcamp ticket provider.
 ---
 --- Auth modes (auto-detected from credentials):
 ---   • Simple key:  api_key only — passed as X-API-KEY header.
@@ -8,7 +8,7 @@
 --- Credentials are stored in the solidtime auth file (never in Lua config).
 --- Run :SolidTime auth freedcamp to set them interactively.
 
-local tickets = require("solidtime.tickets")
+local tickets = require("solidtime.plugins.tickets.providers")
 local logger = require("solidtime.logger")
 
 local BASE_URL = "https://freedcamp.com/api/v1"
@@ -173,11 +173,11 @@ function M.search(query, project_id, callback)
 			local merged = {}
 			local first_err = nil
 			for _, p in ipairs(projects) do
-				M.search(query, tostring(p.id), function(serr, tickets)
+				M.search(query, tostring(p.id), function(serr, tix)
 					if serr then
 						first_err = serr
-					elseif tickets then
-						for _, t in ipairs(tickets) do
+					elseif tix then
+						for _, t in ipairs(tix) do
 							table.insert(merged, t)
 						end
 					end

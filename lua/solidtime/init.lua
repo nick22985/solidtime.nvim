@@ -28,32 +28,58 @@ function M.setup(opts)
 	autotrack.init()
 	ipc.init(config.get().storage_dir)
 
-	local tickets_cfg = config.get().tickets or {}
-	local loaded_providers = {}
+	-- Load plugins.
+	-- Built-in plugins (under solidtime.plugins.*) are always loaded.
+	-- Users can pass options to them and add third-party plugins via config:
+	--   plugins = {
+	--     tickets = { providers = { freedcamp = {} } },          -- built-in (options)
+	--     ["my_solidtime_addon"] = { some_option = true },       -- third-party
+	--   }
+	local plugins_mod = require("solidtime.plugins")
+	local plugins_cfg = config.get().plugins or {}
 
-	for provider_id, provider_opts in pairs(tickets_cfg.providers or {}) do
-		local ok, provider = pcall(require, "solidtime.tickets." .. provider_id)
-		if ok and provider and type(provider.setup) == "function" then
-			local stored_creds = auth.get_provider_creds(provider_id)
-			local effective_opts = vim.tbl_extend("force", provider_opts or {}, stored_creds)
-			provider.setup(effective_opts)
-			loaded_providers[provider_id] = true
-			logger.debug("solidtime: loaded ticket provider '" .. provider_id .. "'")
-		elseif not ok then
-			logger.warn("solidtime: failed to load ticket provider '" .. provider_id .. "': " .. tostring(provider))
+	-- Built-in plugins: always loaded even without explicit config.
+	local BUILTIN_PLUGINS = { "tickets" }
+	for _, builtin_id in ipairs(BUILTIN_PLUGINS) do
+		local plugin_opts = plugins_cfg[builtin_id] or {}
+		local ok, plugin_mod = pcall(require, "solidtime.plugins." .. builtin_id)
+		if ok and plugin_mod then
+			if type(plugin_mod.register) == "function" then
+				plugin_mod.register()
+			end
+			if type(plugin_mod.setup) == "function" then
+				plugin_mod.setup(plugin_opts)
+			end
+			logger.debug("solidtime: loaded built-in plugin '" .. builtin_id .. "'")
 		end
 	end
 
-	local seen_ids = {}
-	local auth_lines = auth.list_provider_ids and auth.list_provider_ids() or {}
-	for _, provider_id in ipairs(auth_lines) do
-		if not loaded_providers[provider_id] and not seen_ids[provider_id] then
-			seen_ids[provider_id] = true
-			local ok, provider = pcall(require, "solidtime.tickets." .. provider_id)
-			if ok and provider and type(provider.setup) == "function" then
-				local stored_creds = auth.get_provider_creds(provider_id)
-				provider.setup(stored_creds)
-				logger.debug("solidtime: auto-loaded ticket provider '" .. provider_id .. "' from auth store")
+	-- Third-party / additional plugins from config.
+	for plugin_id, plugin_opts in pairs(plugins_cfg) do
+		-- Skip built-in plugins (already loaded above).
+		local is_builtin = false
+		for _, bid in ipairs(BUILTIN_PLUGINS) do
+			if plugin_id == bid then
+				is_builtin = true
+				break
+			end
+		end
+		if not is_builtin then
+			-- Try built-in path first, then fall back to the raw id as a module path.
+			local ok, plugin_mod = pcall(require, "solidtime.plugins." .. plugin_id)
+			if not ok then
+				ok, plugin_mod = pcall(require, plugin_id)
+			end
+			if ok and plugin_mod then
+				if type(plugin_mod.register) == "function" then
+					plugin_mod.register()
+				end
+				if type(plugin_mod.setup) == "function" then
+					plugin_mod.setup(plugin_opts)
+				end
+				logger.debug("solidtime: loaded plugin '" .. plugin_id .. "'")
+			elseif not ok then
+				logger.warn("solidtime: failed to load plugin '" .. plugin_id .. "': " .. tostring(plugin_mod))
 			end
 		end
 	end
@@ -90,7 +116,44 @@ function M.setup_keymaps()
 end
 
 function M.RegisterCommands()
-	local tickets_mod = require("solidtime.tickets")
+	local plugins_mod = require("solidtime.plugins")
+
+	-- Built-in subcommands
+	local builtin_commands = {
+		open = function()
+			buffer.open_tab("timer")
+		end,
+		start = function()
+			buffer.startScreen()
+		end,
+		stop = function()
+			tracker.stop()
+		end,
+		edit = function()
+			buffer.open_tab("timer")
+		end,
+		unproject = function()
+			autotrack.unregister_current_project()
+		end,
+		projects = function()
+			buffer.open_tab("projects")
+		end,
+		clients = function()
+			buffer.open_tab("clients")
+		end,
+		entries = function()
+			buffer.open_tab("entries")
+		end,
+		tasks = function()
+			buffer.open_tab("tasks")
+		end,
+		status = function()
+			buffer.open_tab("status")
+		end,
+		reload = function()
+			M.reload()
+		end,
+	}
 
 	vim.api.nvim_create_user_command("SolidTime", function(opts)
 		local subcmd = opts.fargs[1]
@@ -100,47 +163,35 @@ function M.RegisterCommands()
 			buffer.open_tab("timer")
 		elseif subcmd == "auth" then
 			if arg2 and arg2 ~= "" then
-				local provider = tickets_mod.get(arg2)
-				if not provider then
-					local ok, loaded = pcall(require, "solidtime.tickets." .. arg2)
-					if ok then
-						provider = loaded
-					end
-				end
+				local provider = plugins_mod.find_auth_provider(arg2)
 				if provider then
 					auth.prompt_provider_credentials(provider)
 				else
-					print("Unknown ticket provider: " .. arg2)
+					print("Unknown auth provider: " .. arg2)
 				end
 			else
 				auth.prompt_api_key()
 			end
-		elseif subcmd == "start" then
-			buffer.startScreen()
-		elseif subcmd == "stop" then
-			tracker.stop()
-		elseif subcmd == "edit" then
-			buffer.open_tab("timer")
-		elseif subcmd == "unproject" then
-			autotrack.unregister_current_project()
-		elseif subcmd == "projects" then
-			buffer.open_tab("projects")
-		elseif subcmd == "clients" then
-			buffer.open_tab("clients")
-		elseif subcmd == "entries" then
-			buffer.open_tab("entries")
-		elseif subcmd == "tasks" then
-			buffer.open_tab("tasks")
-		elseif subcmd == "status" then
-			buffer.open_tab("status")
-		elseif subcmd == "tickets" then
-			buffer.open_tab("tickets")
-		elseif subcmd == "reload" then
-			M.reload()
+		elseif builtin_commands[subcmd] then
+			builtin_commands[subcmd]()
 		else
-			print(
-				"Usage: :SolidTime [auth [<provider>]|open|start|stop|edit|unproject|projects|clients|entries|tasks|tickets|status|reload]"
-			)
+			-- Check plugin commands
+			local plugin_cmds = plugins_mod.get_all_commands()
+			local handled = false
+			for _, cmd in ipairs(plugin_cmds) do
+				if cmd.name == subcmd then
+					cmd.handler(arg2)
+					handled = true
+					break
+				end
+			end
+			if not handled then
+				local cmd_list = "auth|open|start|stop|edit|unproject|projects|clients|entries|tasks|status|reload"
+				for _, cmd in ipairs(plugin_cmds) do
+					cmd_list = cmd_list .. "|" .. cmd.name
+				end
+				print("Usage: :SolidTime [" .. cmd_list .. "]")
+			end
 		end
 	end, {
 		nargs = "*",
@@ -148,10 +199,7 @@ function M.RegisterCommands()
 			local parts = vim.split(cmd_line, "%s+", { trimempty = true })
 			local completing_provider = (parts[2] == "auth") and (#parts > 2 or arg_lead == "")
 			if completing_provider then
-				local ids = {}
-				for _, p in ipairs(tickets_mod.list()) do
-					table.insert(ids, p.id)
-				end
+				local ids = plugins_mod.all_auth_provider_ids()
 				if arg_lead and arg_lead ~= "" then
 					local filtered = {}
 					for _, id in ipairs(ids) do
@@ -163,7 +211,7 @@ function M.RegisterCommands()
 				end
 				return ids
 			end
-			return {
+			local completions = {
 				"auth",
 				"clients",
 				"edit",
@@ -175,9 +223,13 @@ function M.RegisterCommands()
 				"status",
 				"stop",
 				"tasks",
-				"tickets",
 				"unproject",
 			}
+			for _, cmd in ipairs(plugins_mod.get_all_commands()) do
+				table.insert(completions, cmd.name)
+			end
+			table.sort(completions)
+			return completions
 		end,
 	})
 end

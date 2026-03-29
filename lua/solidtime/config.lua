@@ -58,20 +58,14 @@ M.defaults = {
 		},
 	},
 
-	-- Ticket provider integrations.
-	-- List each provider you want to enable under `providers`.
-	-- Credentials (API keys, secrets) are stored securely in the solidtime
-	-- auth file — never put them here.  Run :SolidTime auth <provider_id>
-	-- to set credentials interactively.
+	-- Plugins.
+	-- Each key is a plugin id (e.g. "tickets") and its value is a table of
+	-- plugin-specific options passed to the plugin's setup().
 	-- Example:
-	--   tickets = {
-	--     providers = {
-	--       freedcamp = {},   -- enable Freedcamp; creds via :SolidTime auth freedcamp
-	--     },
+	--   plugins = {
+	--     tickets = { providers = { freedcamp = {} } },
 	--   },
-	tickets = {
-		providers = {},
-	},
+	plugins = {},
 
 	-- Keymaps. Set any value to false to disable that mapping entirely.
 	keymaps = {
@@ -117,16 +111,10 @@ function M.setup(user_config)
 		merged_autotrack.ignore_buf_patterns = user_autotrack.ignore_buf_patterns
 	end
 
-	local user_tickets = user_config.tickets or {}
-	local merged_tickets = vim.tbl_extend("force", M.defaults.tickets, user_tickets)
-	if user_tickets.providers then
-		merged_tickets.providers = vim.tbl_extend("force", M.defaults.tickets.providers, user_tickets.providers)
-	end
-
 	M.options = vim.tbl_extend("force", M.defaults, user_config)
 	M.options.keymaps = merged_keymaps
 	M.options.autotrack = merged_autotrack
-	M.options.tickets = merged_tickets
+	M.options.plugins = user_config.plugins or {}
 
 	if not user_config.api_url then
 		local active = auth.get_active_url()

@@ -1,4 +1,4 @@
---- solidtime.tickets.planka — Planka ticket provider.
+--- solidtime.plugins.tickets.planka — Planka ticket provider.
 ---
 --- Auth: username + password credentials are used to obtain a JWT access token
 --- via POST /api/access-tokens.  The token is cached in-memory for the session
@@ -7,7 +7,7 @@
 --- Credentials are stored in the solidtime auth file (never in Lua config).
 --- Run :SolidTime auth planka to set them interactively.
 
-local tickets = require("solidtime.tickets")
+local tickets = require("solidtime.plugins.tickets.providers")
 local logger = require("solidtime.logger")
 
 local M = {
@@ -304,9 +304,9 @@ function M.search(query, scope_id, callback)
 		end)
 	else
 		if next(_board_names) == nil then
-			M.get_projects(function(err, _)
-				if err then
-					callback(err, nil)
+			M.get_projects(function(perr, _)
+				if perr then
+					callback(perr, nil)
 					return
 				end
 				M._do_search(query, nil, callback)
