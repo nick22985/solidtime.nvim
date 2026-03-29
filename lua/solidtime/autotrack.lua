@@ -8,10 +8,22 @@ local M = {}
 local last_project_name = nil
 
 local paused = false
+local grace_timer = nil
+local grace_pending_project = nil
+local prompt_generation = 0
+
+local function cancel_grace_timer()
+	if grace_timer then
+		pcall(vim.fn.timer_stop, grace_timer)
+		grace_timer = nil
+	end
+	grace_pending_project = nil
+end
 
 function M.pause()
 	paused = true
 	last_project_name = nil
+	cancel_grace_timer()
 	logger.info("solidtime autotrack: paused (manual stop)")
 end
 
@@ -148,6 +160,38 @@ local function write_projects_config(projects)
 	f:close()
 end
 M.write_config = write_projects_config
+
+local function get_exit_state_path()
+	return (config.get().storage_dir or "") .. "/last_exit.json"
+end
+
+local function save_exit_state(data)
+	local path = get_exit_state_path()
+	local f = io.open(path, "w")
+	if f then
+		f:write(vim.fn.json_encode(data))
+		f:close()
+	end
+end
+
+local function load_and_clear_exit_state()
+	local path = get_exit_state_path()
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local content = f:read("*all")
+	f:close()
+	os.remove(path)
+	if not content or content == "" then
+		return nil
+	end
+	local ok, decoded = pcall(vim.fn.json_decode, content)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+	return decoded
+end
 
 --- Persist the last-used task/description/billable/tags for a project so that
 --- the next auto-start reuses them.  Called by buffer.lua after start/edit.
@@ -348,129 +392,240 @@ end
 ---@param opts? { startup?: boolean }
 local function handle_project(project_name, opts)
 	opts = opts or {}
+
+	-- If a grace timer is already pending for this project, treat as activity.
+	if grace_pending_project == project_name then
+		M.on_activity()
+		return
+	end
+
+	cancel_grace_timer()
+	-- Invalidate any pending prompt_on_conflict callbacks.
+	prompt_generation = prompt_generation + 1
+
 	if project_name == last_project_name then
 		M.on_activity()
 		return
 	end
 
 	local startup = opts.startup or false
-
-	last_project_name = project_name
-	cancel_idle_timers()
-
 	local projects = read_projects_config()
 	local project_cfg = projects[project_name]
+	local at_cfg = config.get().autotrack or {}
 
-	if paused then
-		return
-	end
+	-- The actual switch is wrapped so it can be deferred by the grace period.
+	local function execute_switch()
+		local prev_project_name = last_project_name
+		grace_pending_project = nil
+		last_project_name = project_name
+		cancel_idle_timers()
 
-	local function apply_ci(ci)
-		ci.project_id = project_cfg.solidtime_project_id
-		ci.task_id = project_cfg.last_task_id or nil
-		ci.description = project_cfg.last_description or project_cfg.default_description or nil
-		ci.billable = (project_cfg.last_billable ~= nil) and project_cfg.last_billable
-			or (project_cfg.default_billable or false)
-		ci.tags = (project_cfg.last_tags and #project_cfg.last_tags > 0) and project_cfg.last_tags
-			or (project_cfg.default_tags and #project_cfg.default_tags > 0) and project_cfg.default_tags
-			or nil
-	end
+		if paused then
+			return
+		end
 
-	local function ensure_ci()
-		local ci = tracker.storage.current_information
-		if not ci or not ci.organization_id then
-			if project_cfg.organization_id and project_cfg.member_id then
-				tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
-				ci = tracker.storage.current_information
+		local function apply_ci(ci)
+			ci.project_id = project_cfg.solidtime_project_id
+			ci.task_id = project_cfg.last_task_id or nil
+			ci.description = project_cfg.last_description or project_cfg.default_description or nil
+			ci.billable = (project_cfg.last_billable ~= nil) and project_cfg.last_billable
+				or (project_cfg.default_billable or false)
+			ci.tags = (project_cfg.last_tags and #project_cfg.last_tags > 0) and project_cfg.last_tags
+				or (project_cfg.default_tags and #project_cfg.default_tags > 0) and project_cfg.default_tags
+				or nil
+		end
+
+		local function ensure_ci()
+			local ci = tracker.storage.current_information
+			if not ci or not ci.organization_id then
+				if project_cfg.organization_id and project_cfg.member_id then
+					tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
+					ci = tracker.storage.current_information
+				else
+					logger.warn(
+						"solidtime autotrack: no current_information and no org in project config — cannot auto-start (run :SolidTime open first)"
+					)
+					return nil
+				end
+			end
+			return ci
+		end
+
+		local function do_start(ci, start_opts)
+			tracker.start(start_opts)
+			local notify_delay = startup and ((config.get().autotrack or {}).startup_notify_delay or 100) or 0
+			if notify_delay > 0 then
+				vim.defer_fn(function()
+					notify_auto_started(project_name, project_cfg)
+				end, notify_delay)
 			else
-				logger.warn(
-					"solidtime autotrack: no current_information and no org in project config — cannot auto-start (run :SolidTime open first)"
-				)
-				return nil
-			end
-		end
-		return ci
-	end
-
-	local function do_start(ci)
-		tracker.start()
-		local notify_delay = startup and ((config.get().autotrack or {}).startup_notify_delay or 100) or 0
-		if notify_delay > 0 then
-			vim.defer_fn(function()
 				notify_auto_started(project_name, project_cfg)
-			end, notify_delay)
-		else
-			notify_auto_started(project_name, project_cfg)
-		end
-		reset_idle_timers()
-		if ci.task_id then
-			async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
-		end
-	end
-
-	local function do_adopt(existing_entry)
-		logger.info("solidtime autotrack: adopting existing server entry for " .. project_name)
-		tracker.storage.active_entry = existing_entry
-		tracker.storage.active_entry.tracking_type = "online"
-		local ci = tracker.storage.current_information
-		if not ci or not ci.organization_id then
-			if project_cfg.organization_id and project_cfg.member_id then
-				tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
-				ci = tracker.storage.current_information
+			end
+			reset_idle_timers()
+			if ci.task_id then
+				async_check_task_done(project_name, ci.organization_id, project_cfg.solidtime_project_id, ci.task_id)
 			end
 		end
-		if ci then
-			apply_ci(ci)
-		end
-		reset_idle_timers()
-		local adopted_task_id = ci and ci.task_id
-		if adopted_task_id then
-			async_check_task_done(
-				project_name,
-				project_cfg.organization_id or (ci and ci.organization_id),
-				project_cfg.solidtime_project_id,
-				adopted_task_id
-			)
-		end
-	end
 
-	if project_cfg and project_cfg.auto_start and project_cfg.solidtime_project_id then
-		local api = require("solidtime.api")
-		api.getUserTimeEntry(function(err, existing)
-			if
-				not err
-				and existing
-				and existing.data
-				and existing.data.project_id == project_cfg.solidtime_project_id
-			then
-				local local_entry = tracker.storage.active_entry
-				if local_entry and local_entry.id ~= existing.data.id then
-					ipc.broadcast_stop()
+		local function do_adopt(existing_entry)
+			logger.info("solidtime autotrack: adopting existing server entry for " .. project_name)
+			tracker.storage.active_entry = existing_entry
+			tracker.storage.active_entry.tracking_type = "online"
+			local ci = tracker.storage.current_information
+			if not ci or not ci.organization_id then
+				if project_cfg.organization_id and project_cfg.member_id then
+					tracker.selectActiveOrganization(project_cfg.organization_id, project_cfg.member_id)
+					ci = tracker.storage.current_information
+				end
+			end
+			if ci then
+				apply_ci(ci)
+			end
+			reset_idle_timers()
+			local adopted_task_id = ci and ci.task_id
+			if adopted_task_id then
+				async_check_task_done(
+					project_name,
+					project_cfg.organization_id or (ci and ci.organization_id),
+					project_cfg.solidtime_project_id,
+					adopted_task_id
+				)
+			end
+		end
+
+		--- Performs the API check + stop/start (or adopt) sequence.
+		local function do_auto_start_switch()
+			local api = require("solidtime.api")
+			api.getUserTimeEntry(function(err, existing)
+				if
+					not err
+					and existing
+					and existing.data
+					and existing.data.project_id == project_cfg.solidtime_project_id
+				then
+					local local_entry = tracker.storage.active_entry
+					if local_entry and local_entry.id ~= existing.data.id then
+						ipc.broadcast_stop()
+						tracker.stop({ pause_autotrack = false })
+					end
+					do_adopt(existing.data)
+					return
+				end
+
+				-- Resume-on-restart: if we just reopened nvim for the same
+				-- project within the configured window, delete the old stopped
+				-- entry and start a fresh one with the original start time.
+				if startup then
+					local resume_window = at_cfg.resume_restart_window or 0
+					if resume_window > 0 then
+						local exit_state = load_and_clear_exit_state()
+						if
+							exit_state
+							and exit_state.project_name == project_name
+							and (os.time() - (exit_state.exit_timestamp or 0)) <= resume_window
+						then
+							logger.info("solidtime autotrack: resuming timer from previous session")
+							local function resume_start()
+								ipc.broadcast_stop()
+								if tracker.storage.active_entry then
+									tracker.stop({ pause_autotrack = false })
+								end
+								local ci = ensure_ci()
+								if not ci then
+									return
+								end
+								apply_ci(ci)
+								do_start(ci, { start_time = exit_state.start_time })
+								local notify_delay = (at_cfg.startup_notify_delay or 100)
+								vim.defer_fn(function()
+									vim.notify(
+										"Resumed timer from previous session for " .. project_name,
+										vim.log.levels.INFO,
+										{ title = "SolidTime" }
+									)
+								end, notify_delay)
+							end
+							-- Delete the old stopped entry if we have its id
+							if exit_state.entry_id and exit_state.organization_id then
+								api.deleteTimeEntry(exit_state.organization_id, exit_state.entry_id, function(del_err)
+									if del_err then
+										logger.warn(
+											"solidtime autotrack: could not delete previous entry on resume: "
+												.. tostring(del_err)
+										)
+									end
+									resume_start()
+								end)
+							else
+								resume_start()
+							end
+							return
+						end
+					end
+				end
+
+				ipc.broadcast_stop()
+				if tracker.storage.active_entry then
 					tracker.stop({ pause_autotrack = false })
 				end
-				do_adopt(existing.data)
+
+				if project_cfg.solidtime_project_id then
+					local ci = ensure_ci()
+					if not ci then
+						return
+					end
+					apply_ci(ci)
+					do_start(ci)
+				end
+			end)
+		end
+
+		if project_cfg and project_cfg.auto_start and project_cfg.solidtime_project_id then
+			-- If prompt_on_conflict is enabled and a timer is already running,
+			-- ask the user before switching instead of doing it silently.
+			local prompt_on_conflict = at_cfg.prompt_on_conflict or false
+			if prompt_on_conflict and tracker.storage.active_entry then
+				local gen = prompt_generation
+				vim.ui.select({ "Yes", "No" }, {
+					prompt = "Timer running — stop and start for '" .. project_name .. "'?",
+				}, function(choice)
+					-- Ignore stale prompts (a new switch happened while this was open).
+					if gen ~= prompt_generation then
+						return
+					end
+					if choice == "Yes" then
+						do_auto_start_switch()
+					else
+						-- User declined — restore previous project so the next
+						-- change can re-evaluate.
+						last_project_name = prev_project_name
+					end
+				end)
 				return
 			end
 
+			do_auto_start_switch()
+		else
 			ipc.broadcast_stop()
 			if tracker.storage.active_entry then
 				tracker.stop({ pause_autotrack = false })
 			end
+		end
+	end
 
-			if project_cfg.solidtime_project_id then
-				local ci = ensure_ci()
-				if not ci then
-					return
-				end
-				apply_ci(ci)
-				do_start(ci)
-			end
+	-- Grace period: delay the entire switch so brief visits don't trigger
+	-- auto-start/stop.  Startup always fires immediately.
+	local grace_seconds = at_cfg.grace_period or 0
+	if grace_seconds > 0 and not startup then
+		grace_pending_project = project_name
+		grace_timer = vim.fn.timer_start(grace_seconds * 1000, function()
+			grace_timer = nil
+			vim.schedule(function()
+				execute_switch()
+			end)
 		end)
 	else
-		ipc.broadcast_stop()
-		if tracker.storage.active_entry then
-			tracker.stop({ pause_autotrack = false })
-		end
+		execute_switch()
 	end
 end
 
@@ -733,6 +888,7 @@ function M.init()
 		group = augroup,
 		once = true,
 		callback = function()
+			cancel_grace_timer()
 			local cfg = config.get()
 			local at_cfg = cfg.autotrack or {}
 			if not at_cfg.stop_on_exit then
@@ -761,6 +917,25 @@ function M.init()
 				return
 			end
 			logger.info("solidtime autotrack: exit — stopping timer (no other nvim in project)")
+			-- Save exit state for potential resume-on-restart.
+			local resume_window = at_cfg.resume_restart_window or 0
+			if resume_window > 0 and tracker.storage.active_entry then
+				local active = tracker.storage.active_entry
+				save_exit_state({
+					project_name = current_project,
+					entry_id = active.id,
+					start_time = active.start,
+					start_timestamp = active.start_timestamp,
+					exit_timestamp = os.time(),
+					organization_id = active.organization_id,
+					member_id = active.member_id,
+					project_id = active.project_id,
+					task_id = active.task_id,
+					description = active.description,
+					billable = active.billable,
+					tags = active.tags,
+				})
+			end
 			tracker.stop({ pause_autotrack = false })
 		end,
 	})

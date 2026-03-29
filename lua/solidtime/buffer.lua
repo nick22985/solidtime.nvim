@@ -2906,6 +2906,16 @@ function M._tab_tasks(project_id, project_name)
 	local org_id = ci and ci.organization_id
 
 	if not project_id then
+		local autotrack_mod = require("solidtime.autotrack")
+		local detected = autotrack_mod.detect_project()
+		if detected then
+			local proj_cfg = autotrack_mod.read_config()[detected] or {}
+			if proj_cfg.solidtime_project_id then
+				M._tab_tasks(proj_cfg.solidtime_project_id, detected)
+				return
+			end
+		end
+
 		if not org_id then
 			vim.notify("No organization selected. Run :SolidTime open first.", vim.log.levels.WARN)
 			return
@@ -3177,16 +3187,18 @@ function M._tab_tasks(project_id, project_name)
 
 		bmap(buf, km().add, function()
 			shell_input("Task name:", "", function(name)
-				if not name then
+				if not name or name:match("^%s*$") then
 					return
 				end
+				name = name:match("^%s*(.-)%s*$")
 				api.createTask(org_id, { name = name, is_done = false, project_id = project_id }, function(err, result)
 					if err or (result and result.error) then
 						vim.notify("Failed to create task: " .. tostring(err or result.error), vim.log.levels.ERROR)
 						return
 					end
-					if result and result.data then
-						table.insert(tasks, result.data)
+					local new_task = result and result.data
+					if new_task then
+						table.insert(tasks, new_task)
 					end
 					vim.notify("Task created: " .. name, vim.log.levels.INFO)
 					vim.schedule(function()
@@ -4436,7 +4448,9 @@ function M._tab_tickets_for(provider)
 					tracker.storage.current_information = {}
 				end
 				tracker.storage.current_information.description = ticket.title
-				timer_tab_open_start_form()
+				tracker.start()
+				shell.stack = {}
+				M._tab_timer()
 			end
 
 			local function do_create_task(then_cb)
@@ -4542,7 +4556,9 @@ function M._tab_tickets_for(provider)
 						tracker.storage.current_information.task_id = new_task.id
 						tracker.storage.current_information.project_id = new_task.project_id or solidtime_project_id()
 					end
-					timer_tab_open_start_form()
+					tracker.start()
+					shell.stack = {}
+					M._tab_timer()
 				end)
 			end
 		end)

@@ -318,8 +318,10 @@ function M.sync_pending()
 	end
 end
 
-function M.start()
-	local now = os.time()
+function M.start(opts)
+	opts = opts or {}
+	local now = opts.start_timestamp or os.time()
+	local start_iso = opts.start_time or format_iso8601(now)
 
 	local current_information = M.storage.current_information
 
@@ -370,7 +372,7 @@ function M.start()
 	end
 
 	M.storage.active_entry = {
-		start = format_iso8601(now),
+		start = start_iso,
 		start_timestamp = now,
 		tracking_type = isOnline and "online" or "local",
 		organization_id = organization_id,
@@ -449,6 +451,10 @@ function M.stop(opts)
 		if not M.storage.active_entry.organization_id or not M.storage.active_entry.id then
 			logger.error("No active time entry to stop.")
 			return
+		end
+		local remote = api.getUserTimeEntry()
+		if remote and remote.data and remote.data.id == M.storage.active_entry.id then
+			M.storage.active_entry.start = remote.data.start
 		end
 		local result = api.updateTimeEntry(M.storage.active_entry.organization_id, M.storage.active_entry.id, {
 			member_id = M.storage.active_entry.member_id,

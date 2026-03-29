@@ -29,6 +29,22 @@ M.defaults = {
 		-- leave the timer running on exit (the default behaviour before this option).
 		stop_on_exit = true,
 
+		-- Grace period in seconds before auto-start triggers on project switch.
+		-- If you leave the project before this period, the timer won't start.
+		-- Set to 0 to start immediately (default).  Ignored on startup.
+		grace_period = 0,
+
+		-- When true, switching to an auto-start project while a timer is
+		-- already running prompts for confirmation instead of switching
+		-- automatically.
+		prompt_on_conflict = false,
+
+		-- If nvim is closed and reopened for the same project within this
+		-- many seconds, the stopped entry is deleted and a new one is created
+		-- with the original start time (effectively resuming the session).
+		-- Set to 0 to disable.
+		resume_restart_window = 0,
+
 		ignore_buftypes = { "nofile", "terminal", "help", "quickfix", "prompt" },
 
 		ignore_buf_patterns = {
