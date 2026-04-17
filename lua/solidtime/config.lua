@@ -29,6 +29,29 @@ M.defaults = {
 		-- leave the timer running on exit (the default behaviour before this option).
 		stop_on_exit = true,
 
+		-- When true, entering an unregistered project will search for a matching
+		-- Solidtime project (case-insensitive name) and, if none is found, create
+		-- one.  The new project is registered in projects.json with auto_start
+		-- enabled so subsequent visits start the timer automatically.
+		-- Requires an active organization (run :SolidTime open first).
+		auto_setup_project = false,
+
+		-- Default values applied when auto_setup_project creates a new entry.
+		auto_setup_defaults = {
+			auto_start = true, -- auto-start timer for the new project
+			billable = false, -- default billable flag
+			color = "#2da7c7", -- project colour in Solidtime ("random" for a random hex)
+			description = "", -- default time-entry description
+
+			-- When true, try to attach the new project to an existing client.
+			-- Resolution order:
+			--   1. git remote owner of "origin" (e.g. github.com/<owner>/<repo>)
+			--   2. any path segment of the cwd that matches a client name
+			-- Matching is case-insensitive against existing client names.
+			-- No client is created — falls back to null if nothing matches.
+			infer_client = false,
+		},
+
 		-- Grace period in seconds before auto-start triggers on project switch.
 		-- If you leave the project before this period, the timer won't start.
 		-- Set to 0 to start immediately (default).  Ignored on startup.
@@ -103,6 +126,12 @@ function M.setup(user_config)
 	local merged_keymaps = vim.tbl_extend("force", M.defaults.keymaps, user_config.keymaps or {})
 	local user_autotrack = user_config.autotrack or {}
 	local merged_autotrack = vim.tbl_extend("force", M.defaults.autotrack, user_autotrack)
+	-- Deep-merge nested option tables so partial overrides keep defaults.
+	merged_autotrack.auto_setup_defaults = vim.tbl_extend(
+		"force",
+		M.defaults.autotrack.auto_setup_defaults,
+		user_autotrack.auto_setup_defaults or {}
+	)
 	-- List fields: user values *replace* defaults when provided; otherwise keep defaults.
 	if user_autotrack.ignore_buftypes ~= nil then
 		merged_autotrack.ignore_buftypes = user_autotrack.ignore_buftypes

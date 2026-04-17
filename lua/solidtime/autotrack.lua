@@ -2,6 +2,7 @@ local config = require("solidtime.config")
 local tracker = require("solidtime.tracker")
 local logger = require("solidtime.logger")
 local ipc = require("solidtime.ipc")
+local cache = require("solidtime.cache")
 
 local M = {}
 
@@ -160,6 +161,31 @@ local function write_projects_config(projects)
 	f:close()
 end
 M.write_config = write_projects_config
+
+--- Remove any project entries whose solidtime_project_id matches.  Used when
+--- the server returns "resource does not exist" for a project we still have
+--- cached locally (e.g. the project was deleted in Solidtime).
+---@param solidtime_project_id string
+---@return string[]  names removed
+function M.invalidate_project_by_id(solidtime_project_id)
+	if not solidtime_project_id or solidtime_project_id == "" then
+		return {}
+	end
+	local projects = read_projects_config()
+	local removed = {}
+	for name, cfg in pairs(projects) do
+		if cfg.solidtime_project_id == solidtime_project_id then
+			projects[name] = nil
+			table.insert(removed, name)
+		end
+	end
+	if #removed > 0 then
+		write_projects_config(projects)
+		last_project_name = nil
+		logger.info("solidtime autotrack: removed stale project entries: " .. table.concat(removed, ", "))
+	end
+	return removed
+end
 
 local function get_exit_state_path()
 	return (config.get().storage_dir or "") .. "/last_exit.json"
@@ -388,9 +414,179 @@ local function async_check_task_done(project_name, org_id, project_id, task_id)
 	end)
 end
 
+-- Forward declaration — handle_project is defined below auto_setup_and_start
+-- because auto_setup_and_start re-enters it after registering a new project.
+local handle_project
+
+--- Parse the "owner" segment of the origin remote URL (ssh or https).
+--- Returns nil if the cwd has no git origin or the URL can't be parsed.
+---@return string|nil
+local function detect_git_origin_owner()
+	local escaped = vim.fn.shellescape(vim.fn.getcwd())
+	local url = vim.fn.systemlist("git -C " .. escaped .. " remote get-url origin 2>/dev/null")[1]
+	if not url or url == "" or url:match("^fatal") then
+		return nil
+	end
+	-- git@host:owner/repo(.git)?  or  https://host/owner/repo(.git)?
+	local owner = url:match("[:/]([^/:]+)/[^/]+%.git$") or url:match("[:/]([^/:]+)/[^/]+/?$")
+	return owner
+end
+
+--- Case-insensitive lookup of a client by name.
+---@param clients table[]
+---@param name string
+---@return string|nil  client id if found
+local function find_client_id_by_name(clients, name)
+	local lower = name:lower()
+	for _, c in ipairs(clients) do
+		if c.name and c.name:lower() == lower then
+			return c.id
+		end
+	end
+	return nil
+end
+
+--- Resolve a client_id for a new project using git origin owner first,
+--- then any matching path segment of the cwd.  Returns vim.NIL when
+--- nothing matches (so json_encode emits an explicit `null`).
+---@param organization_id string
+---@param callback fun(client_id: string|userdata)
+local function resolve_client_id(organization_id, callback)
+	local api = require("solidtime.api")
+	api.getOrganizationClients(organization_id, function(err, result)
+		if err or not result or not result.data then
+			callback(vim.NIL)
+			return
+		end
+		local clients = result.data
+
+		local owner = detect_git_origin_owner()
+		if owner then
+			local id = find_client_id_by_name(clients, owner)
+			if id then
+				logger.info("solidtime autotrack: inferred client '" .. owner .. "' from git origin")
+				callback(id)
+				return
+			end
+		end
+
+		local cwd = vim.fn.getcwd()
+		for segment in cwd:gmatch("[^/\\]+") do
+			local id = find_client_id_by_name(clients, segment)
+			if id then
+				logger.info("solidtime autotrack: inferred client '" .. segment .. "' from path")
+				callback(id)
+				return
+			end
+		end
+
+		callback(vim.NIL)
+	end)
+end
+
+--- Search existing Solidtime projects for a case-insensitive name match.
+--- If no match is found, create the project in Solidtime.  Either way,
+--- register the result in projects.json and re-enter handle_project so
+--- the normal auto-start path kicks in.
+---@param project_name string  git/cwd project name
+---@param opts { startup: boolean? }?
+local function auto_setup_and_start(project_name, opts)
+	local ci = tracker.storage.current_information
+	if not ci or not ci.organization_id or not ci.member_id then
+		logger.warn(
+			"solidtime autotrack: auto_setup_project requires an active organization — run :SolidTime open first"
+		)
+		return
+	end
+
+	local api = require("solidtime.api")
+	local at_cfg = config.get().autotrack or {}
+	local defaults = at_cfg.auto_setup_defaults or {}
+
+	api.getOrganizationProjects(ci.organization_id, function(err, result)
+		if err then
+			logger.warn("solidtime autotrack: failed to fetch projects for auto-setup: " .. tostring(err))
+			return
+		end
+
+		local project_list = (result and result.data) or {}
+		local lower_name = project_name:lower()
+
+		local matched_project = nil
+		for _, p in ipairs(project_list) do
+			if p.name and p.name:lower() == lower_name then
+				matched_project = p
+				break
+			end
+		end
+
+		local function register_and_start(solidtime_project)
+			local projects = read_projects_config()
+			projects[project_name] = {
+				solidtime_project_id = solidtime_project.id,
+				organization_id = ci.organization_id,
+				member_id = ci.member_id,
+				auto_start = defaults.auto_start ~= false,
+				default_description = (defaults.description and defaults.description ~= "") and defaults.description
+					or nil,
+				default_billable = defaults.billable or false,
+				default_tags = {},
+			}
+			write_projects_config(projects)
+
+			cache.invalidate_cache("organizations/" .. ci.organization_id .. "/projects")
+
+			vim.notify(
+				"Auto-setup: '" .. project_name .. "' → '" .. solidtime_project.name .. "'",
+				vim.log.levels.INFO,
+				{ title = "SolidTime" }
+			)
+
+			last_project_name = nil
+			handle_project(project_name, opts)
+		end
+
+		if matched_project then
+			logger.info("solidtime autotrack: auto-setup matched existing project '" .. matched_project.name .. "'")
+			register_and_start(matched_project)
+		else
+			local color = defaults.color or "#2da7c7"
+			if color == "random" then
+				color = string.format("#%06x", math.random(0, 0xffffff))
+			end
+
+			local function do_create(client_id)
+				local create_data = {
+					name = project_name,
+					color = color,
+					is_billable = defaults.billable or false,
+					billable_by_default = defaults.billable or false,
+					client_id = client_id,
+				}
+				api.createProject(ci.organization_id, create_data, function(create_err, created)
+					if create_err or not created or not created.data then
+						logger.warn(
+							"solidtime autotrack: failed to create project for auto-setup: " .. tostring(create_err)
+						)
+						return
+					end
+					logger.info("solidtime autotrack: auto-setup created new project '" .. project_name .. "'")
+					register_and_start(created.data)
+				end)
+			end
+
+			if defaults.infer_client then
+				resolve_client_id(ci.organization_id, do_create)
+			else
+				do_create(vim.NIL)
+			end
+		end
+	end)
+end
+
 ---@param project_name string  git/cwd project name (for projects.json update)
----@param opts? { startup?: boolean }
-local function handle_project(project_name, opts)
+---@param opts { startup: boolean? }?
+handle_project = function(project_name, opts)
 	opts = opts or {}
 
 	-- If a grace timer is already pending for this project, treat as activity.
@@ -605,6 +801,8 @@ local function handle_project(project_name, opts)
 			end
 
 			do_auto_start_switch()
+		elseif not project_cfg and at_cfg.auto_setup_project then
+			auto_setup_and_start(project_name, opts)
 		else
 			ipc.broadcast_stop()
 			if tracker.storage.active_entry then
@@ -748,15 +946,6 @@ function M.register_current_project()
 								if not task_err and task_result and task_result.data then
 									for _, t in ipairs(task_result.data) do
 										table.insert(task_items, t)
-									end
-								end
-
-								local current_task_id = existing.last_task_id or nil
-								local current_task_idx = 1
-								for i, t in ipairs(task_items) do
-									if t.id == current_task_id then
-										current_task_idx = i
-										break
 									end
 								end
 

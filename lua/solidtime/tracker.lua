@@ -395,8 +395,43 @@ function M.start(opts)
 			tags = tags,
 		})
 		if result and result.error then
-			logger.error("Failed to start time entry: " .. result.error)
 			M.storage.active_entry = nil
+			local handled = false
+			if project_id and result.error:match("resource does not exist") then
+				local ok, autotrack = pcall(require, "solidtime.autotrack")
+				if ok and autotrack.invalidate_project_by_id then
+					local removed = autotrack.invalidate_project_by_id(project_id)
+					if #removed > 0 then
+						handled = true
+						logger.warn(
+							"solidtime: project no longer exists on server — removed local entry for "
+								.. table.concat(removed, ", ")
+						)
+						local at_cfg = (require("solidtime.config").get() or {}).autotrack or {}
+						if at_cfg.auto_setup_project then
+							vim.notify(
+								"Solidtime project no longer exists — recreating via auto-setup: "
+									.. table.concat(removed, ", "),
+								vim.log.levels.WARN,
+								{ title = "SolidTime" }
+							)
+							if autotrack.on_project_change then
+								autotrack.on_project_change()
+							end
+						else
+							vim.notify(
+								"Solidtime project no longer exists — removed local entry for: "
+									.. table.concat(removed, ", "),
+								vim.log.levels.WARN,
+								{ title = "SolidTime" }
+							)
+						end
+					end
+				end
+			end
+			if not handled then
+				logger.error("Failed to start time entry: " .. result.error)
+			end
 			return
 		end
 		if result == nil or result.data == nil then
