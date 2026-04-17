@@ -68,9 +68,12 @@ local function parse_response(response, endpoint, cache_key, ttl)
 	logger.debug(string.format("Received response status: %d for URL: %s", response.status, endpoint))
 
 	if response.status == 200 or response.status == 201 then
-		local ok, decoded = pcall(vim.json.decode, response.body or "")
+		local body = response.body or ""
+		if body == "" then
+			return nil, {}
+		end
+		local ok, decoded = pcall(vim.json.decode, body)
 		if not ok or decoded == nil then
-			local body = response.body or ""
 			local err
 			if body:match("^<!DOCTYPE") or body:match("^<html") then
 				err = "API key invalid or expired — run :SolidTime auth to re-authenticate"

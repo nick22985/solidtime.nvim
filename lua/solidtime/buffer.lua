@@ -39,6 +39,14 @@ end
 local shell_back_or_close_fn = nil
 
 local _timer_bg_sync = nil
+local _timer_pending_tick = nil
+
+local function stop_pending_tick()
+	if _timer_pending_tick then
+		pcall(vim.fn.timer_stop, _timer_pending_tick)
+		_timer_pending_tick = nil
+	end
+end
 
 local shell = {
 	win = nil,
@@ -71,6 +79,7 @@ local function shell_close()
 		vim.fn.timer_stop(_timer_bg_sync)
 		_timer_bg_sync = nil
 	end
+	stop_pending_tick()
 end
 
 local DEFAULT_W = 90
@@ -144,6 +153,38 @@ local function shell_redraw()
 		bmap(shell.buf, km().close, shell_back_or_close_fn, "Back / Close")
 		bmap(shell.buf, km().close_alt, shell_back_or_close_fn, "Back / Close")
 	end
+end
+
+local function start_pending_tick()
+	stop_pending_tick()
+	local had_pending = autotrack.get_pending_switch and autotrack.get_pending_switch() ~= nil
+	_timer_pending_tick = vim.fn.timer_start(1000, function()
+		if not shell_is_open() then
+			stop_pending_tick()
+			return
+		end
+		local now_pending = autotrack.get_pending_switch and autotrack.get_pending_switch() ~= nil
+		if now_pending then
+			vim.schedule(function()
+				if shell_is_open() then
+					shell_redraw()
+				end
+			end)
+		elseif had_pending then
+			vim.schedule(function()
+				if shell_is_open() and shell.active_tab then
+					local active_id = TABS[shell.active_tab] and TABS[shell.active_tab].id
+					if active_id == "timer" then
+						shell.stack = {}
+						M._tab_timer()
+					else
+						shell_redraw()
+					end
+				end
+			end)
+		end
+		had_pending = now_pending
+	end, { ["repeat"] = -1 })
 end
 
 local function shell_open(tab_idx)
@@ -1597,6 +1638,19 @@ function M._tab_timer(opts)
 			local lbl = string.format("  %-14s│ ", "Status")
 			table.insert(lines, string.rep("─", inner_w))
 			table.insert(lines, lbl .. "○ Stopped")
+			local pending = autotrack.get_pending_switch and autotrack.get_pending_switch()
+			if pending then
+				local remaining = math.max(0, (pending.detected_at + pending.grace_seconds) - os.time())
+				table.insert(
+					lines,
+					string.format(
+						"  %-14s│ → %s  (%ds left)  [c commit · K keep]",
+						"Pending",
+						pending.project,
+						remaining
+					)
+				)
+			end
 			table.insert(lines, string.rep("─", inner_w))
 			table.insert(lines, "")
 			table.insert(lines, "  s start   <Tab>/<S-Tab> cycle   <leader>1-6 jump   q close")
@@ -1613,8 +1667,25 @@ function M._tab_timer(opts)
 			vim.keymap.set("n", "s", function()
 				timer_tab_open_start_form()
 			end, { buffer = buf, nowait = true, desc = "Start timer" })
+			vim.keymap.set("n", "c", function()
+				if autotrack.commit_pending_switch and autotrack.commit_pending_switch() then
+					vim.schedule(function()
+						shell.stack = {}
+						M._tab_timer()
+					end)
+				end
+			end, { buffer = buf, nowait = true, desc = "Commit pending switch" })
+			vim.keymap.set("n", "K", function()
+				if autotrack.cancel_pending_switch and autotrack.cancel_pending_switch() then
+					vim.notify("Pending switch cancelled — staying on previous project.", vim.log.levels.INFO, {
+						title = "SolidTime",
+					})
+					shell_redraw()
+				end
+			end, { buffer = buf, nowait = true, desc = "Keep previous (cancel pending switch)" })
 		end
 		shell_push({ render = render, install_keymaps = install_keymaps })
+		start_pending_tick()
 		return
 	end
 
@@ -1732,6 +1803,21 @@ function M._tab_timer(opts)
 				end,
 			},
 		}
+		if autotrack.get_pending_switch then
+			table.insert(fields, {
+				key = "pending_switch",
+				label = "Pending",
+				value = true,
+				display = function(_)
+					local pending = autotrack.get_pending_switch()
+					if not pending then
+						return "(none)"
+					end
+					local remaining = math.max(0, (pending.detected_at + pending.grace_seconds) - os.time())
+					return string.format("→ %s  (%ds left)  [c commit · K keep]", pending.project, remaining)
+				end,
+			})
+		end
 		for _, f in ipairs(entry_fields) do
 			table.insert(fields, f)
 		end
@@ -1880,6 +1966,7 @@ function M._tab_timer(opts)
 			end
 		end
 
+		start_pending_tick()
 		vim.schedule(function()
 			if not shell_is_open() then
 				return
@@ -1893,6 +1980,26 @@ function M._tab_timer(opts)
 				shell.stack = {}
 				M._tab_timer()
 			end, { buffer = shell.buf, nowait = true, desc = "Stop timer" })
+			vim.keymap.set("n", "c", function()
+				if autotrack.commit_pending_switch and autotrack.commit_pending_switch() then
+					if _timer_bg_sync then
+						vim.fn.timer_stop(_timer_bg_sync)
+						_timer_bg_sync = nil
+					end
+					vim.schedule(function()
+						shell.stack = {}
+						M._tab_timer()
+					end)
+				end
+			end, { buffer = shell.buf, nowait = true, desc = "Commit pending switch" })
+			vim.keymap.set("n", "K", function()
+				if autotrack.cancel_pending_switch and autotrack.cancel_pending_switch() then
+					vim.notify("Pending switch cancelled — staying on previous project.", vim.log.levels.INFO, {
+						title = "SolidTime",
+					})
+					shell_redraw()
+				end
+			end, { buffer = shell.buf, nowait = true, desc = "Keep previous (cancel pending switch)" })
 		end)
 	end
 

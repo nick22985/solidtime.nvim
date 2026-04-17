@@ -11,14 +11,77 @@ local last_project_name = nil
 local paused = false
 local grace_timer = nil
 local grace_pending_project = nil
+local grace_pending_timestamp = nil
+local grace_pending_execute = nil
+local cancel_suppressed_project = nil
 local prompt_generation = 0
+local handle_generation = 0
+
+local handle_project
+
+local function grace_state_path()
+	return (config.get().storage_dir or "") .. "/grace_state.json"
+end
+
+---@return { project: string, detected_at: integer, grace_seconds: integer, prev_project: string|nil, owner_pid: integer }|nil
+local function read_grace_state()
+	local path = grace_state_path()
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local content = f:read("*all")
+	f:close()
+	if not content or content == "" then
+		return nil
+	end
+	local ok, decoded = pcall(vim.fn.json_decode, content)
+	if not ok or type(decoded) ~= "table" or not decoded.project or not decoded.detected_at then
+		return nil
+	end
+	-- Guard against very stale state that never got cleaned up (crash, etc.).
+	local grace_seconds = decoded.grace_seconds or 0
+	if decoded.detected_at + grace_seconds + 120 < os.time() then
+		os.remove(path)
+		return nil
+	end
+	return decoded
+end
+
+local function write_grace_state(state)
+	local path = grace_state_path()
+	local dir = vim.fn.fnamemodify(path, ":h")
+	vim.fn.mkdir(dir, "p")
+	local f = io.open(path, "w")
+	if not f then
+		return
+	end
+	f:write(vim.fn.json_encode(state))
+	f:close()
+end
+
+local function clear_grace_state()
+	os.remove(grace_state_path())
+end
 
 local function cancel_grace_timer()
+	if grace_timer or grace_pending_project then
+		logger.info(
+			string.format("solidtime autotrack: grace cancelled (was pending '%s')", tostring(grace_pending_project))
+		)
+	end
 	if grace_timer then
 		pcall(vim.fn.timer_stop, grace_timer)
 		grace_timer = nil
 	end
 	grace_pending_project = nil
+	grace_pending_timestamp = nil
+	grace_pending_prev_project = nil
+	grace_pending_execute = nil
+	-- Note: intentionally does NOT touch the shared state file.  The next
+	-- decide_and_go call overwrites it (latest-switch-wins), and specific
+	-- events (commit, user cancel, return to running project) clear it
+	-- explicitly.
 end
 
 function M.pause()
@@ -26,6 +89,14 @@ function M.pause()
 	last_project_name = nil
 	cancel_grace_timer()
 	logger.info("solidtime autotrack: paused (manual stop)")
+end
+
+--- Clear local autotrack state so the next handle_project call re-evaluates
+--- from scratch.  Called via IPC when another nvim commits a switch, so this
+--- instance's stale last_project_name doesn't mask the server's new state.
+function M.reset_local_state()
+	last_project_name = nil
+	cancel_grace_timer()
 end
 
 function M.resume()
@@ -102,7 +173,31 @@ local function reset_idle_timers()
 	end
 end
 
+local last_presence_check = 0
+local PRESENCE_CHECK_INTERVAL = 3
+
+local function ensure_presence()
+	local now = os.time()
+	if now - last_presence_check < PRESENCE_CHECK_INTERVAL then
+		return
+	end
+	last_presence_check = now
+
+	local project_name = M.detect_project()
+	if not project_name then
+		return
+	end
+
+	local state = read_grace_state()
+	if state and state.project == project_name then
+		return
+	end
+
+	handle_project(project_name, { fresh = true })
+end
+
 function M.on_activity()
+	ensure_presence()
 	if not tracker.storage.active_entry then
 		return
 	end
@@ -414,10 +509,6 @@ local function async_check_task_done(project_name, org_id, project_id, task_id)
 	end)
 end
 
--- Forward declaration — handle_project is defined below auto_setup_and_start
--- because auto_setup_and_start re-enters it after registering a new project.
-local handle_project
-
 --- Parse the "owner" segment of the origin remote URL (ssh or https).
 --- Returns nil if the cwd has no git origin or the URL can't be parsed.
 ---@return string|nil
@@ -589,10 +680,20 @@ end
 handle_project = function(project_name, opts)
 	opts = opts or {}
 
-	-- If a grace timer is already pending for this project, treat as activity.
-	if grace_pending_project == project_name then
+	handle_generation = handle_generation + 1
+	local my_gen = handle_generation
+
+	if grace_pending_project == project_name and not opts.fresh then
 		M.on_activity()
 		return
+	end
+
+	if cancel_suppressed_project == project_name then
+		M.on_activity()
+		return
+	end
+	if cancel_suppressed_project and cancel_suppressed_project ~= project_name then
+		cancel_suppressed_project = nil
 	end
 
 	cancel_grace_timer()
@@ -600,6 +701,7 @@ handle_project = function(project_name, opts)
 	prompt_generation = prompt_generation + 1
 
 	if project_name == last_project_name then
+		pcall(clear_grace_state)
 		M.on_activity()
 		return
 	end
@@ -609,10 +711,32 @@ handle_project = function(project_name, opts)
 	local project_cfg = projects[project_name]
 	local at_cfg = config.get().autotrack or {}
 
-	-- The actual switch is wrapped so it can be deferred by the grace period.
-	local function execute_switch()
+	local active = tracker.storage.active_entry
+	if
+		active
+		and project_cfg
+		and project_cfg.solidtime_project_id
+		and active.project_id == project_cfg.solidtime_project_id
+	then
+		last_project_name = project_name
+		pcall(clear_grace_state)
+		M.on_activity()
+		return
+	end
+
+	local would_start = project_cfg and project_cfg.auto_start and project_cfg.solidtime_project_id
+	local would_setup = not project_cfg and at_cfg.auto_setup_project
+	if not would_start and not would_setup then
+		M.on_activity()
+		return
+	end
+
+	local function execute_switch(commit_time)
 		local prev_project_name = last_project_name
 		grace_pending_project = nil
+		grace_pending_timestamp = nil
+		grace_pending_prev_project = nil
+		grace_pending_execute = nil
 		last_project_name = project_name
 		cancel_idle_timers()
 
@@ -702,7 +826,7 @@ handle_project = function(project_name, opts)
 					local local_entry = tracker.storage.active_entry
 					if local_entry and local_entry.id ~= existing.data.id then
 						ipc.broadcast_stop()
-						tracker.stop({ pause_autotrack = false })
+						tracker.stop({ pause_autotrack = false, end_timestamp = commit_time })
 					end
 					do_adopt(existing.data)
 					return
@@ -762,7 +886,7 @@ handle_project = function(project_name, opts)
 
 				ipc.broadcast_stop()
 				if tracker.storage.active_entry then
-					tracker.stop({ pause_autotrack = false })
+					tracker.stop({ pause_autotrack = false, end_timestamp = commit_time })
 				end
 
 				if project_cfg.solidtime_project_id then
@@ -771,7 +895,7 @@ handle_project = function(project_name, opts)
 						return
 					end
 					apply_ci(ci)
-					do_start(ci)
+					do_start(ci, commit_time and { start_timestamp = commit_time } or nil)
 				end
 			end)
 		end
@@ -806,25 +930,144 @@ handle_project = function(project_name, opts)
 		else
 			ipc.broadcast_stop()
 			if tracker.storage.active_entry then
-				tracker.stop({ pause_autotrack = false })
+				tracker.stop({ pause_autotrack = false, end_timestamp = commit_time })
 			end
 		end
 	end
 
-	-- Grace period: delay the entire switch so brief visits don't trigger
-	-- auto-start/stop.  Startup always fires immediately.
 	local grace_seconds = at_cfg.grace_period or 0
-	if grace_seconds > 0 and not startup then
-		grace_pending_project = project_name
-		grace_timer = vim.fn.timer_start(grace_seconds * 1000, function()
-			grace_timer = nil
+
+	local function decide_and_go(running_pid, source)
+		local running_different = running_pid
+			and project_cfg
+			and project_cfg.solidtime_project_id
+			and running_pid ~= project_cfg.solidtime_project_id
+		local should_grace = grace_seconds > 0 and (running_different or (not startup and last_project_name ~= nil))
+
+		logger.info(
+			string.format(
+				"solidtime autotrack handle_project: name=%s last=%s startup=%s project_cfg=%s running_pid=%s (src=%s) cfg_pid=%s running_diff=%s should_grace=%s grace_s=%d",
+				tostring(project_name),
+				tostring(last_project_name),
+				tostring(startup),
+				tostring(project_cfg ~= nil),
+				tostring(running_pid),
+				tostring(source),
+				tostring(project_cfg and project_cfg.solidtime_project_id),
+				tostring(running_different),
+				tostring(should_grace),
+				grace_seconds
+			)
+		)
+
+		if should_grace then
+			local detected_at = os.time()
+			grace_pending_project = project_name
+			grace_pending_timestamp = detected_at
+			grace_pending_prev_project = last_project_name
+			grace_pending_execute = function()
+				execute_switch(detected_at)
+			end
+			write_grace_state({
+				project = project_name,
+				detected_at = detected_at,
+				grace_seconds = grace_seconds,
+				prev_project = last_project_name,
+				owner_pid = vim.fn.getpid(),
+			})
+			logger.info(
+				string.format(
+					"solidtime autotrack: grace started for '%s' T=%d (countdown %ds)",
+					project_name,
+					detected_at,
+					grace_seconds
+				)
+			)
+			grace_timer = vim.fn.timer_start(grace_seconds * 1000, function()
+				grace_timer = nil
+				vim.schedule(function()
+					local exec = grace_pending_execute
+					grace_pending_execute = nil
+					local state = read_grace_state()
+					if not state or state.project ~= project_name or state.detected_at ~= detected_at then
+						return
+					end
+					pcall(clear_grace_state)
+					if exec then
+						exec()
+					end
+				end)
+			end)
+		else
+			pcall(clear_grace_state)
+			execute_switch()
+		end
+	end
+
+	if active and active.project_id then
+		decide_and_go(active.project_id, "local")
+	else
+		local api = require("solidtime.api")
+		api.getUserTimeEntry(function(err, result)
+			local server_pid = nil
+			if not err and result and result.data then
+				server_pid = result.data.project_id
+			end
 			vim.schedule(function()
-				execute_switch()
+				if my_gen ~= handle_generation then
+					return
+				end
+				decide_and_go(server_pid, "server")
 			end)
 		end)
-	else
-		execute_switch()
 	end
+end
+
+--- Describes the in-flight pending switch (if any) for the dashboard UI.
+--- Reads the shared state file so every nvim instance sees the same timer.
+---@return { project: string, prev_project: string|nil, detected_at: integer, grace_seconds: integer }|nil
+function M.get_pending_switch()
+	local state = read_grace_state()
+	if not state then
+		return nil
+	end
+	return {
+		project = state.project,
+		prev_project = state.prev_project,
+		detected_at = state.detected_at,
+		grace_seconds = state.grace_seconds or 0,
+	}
+end
+
+--- Commit the pending grace switch immediately (backdated to detection time).
+--- Only the instance that started the grace can commit via the local closure;
+--- from other instances this is a no-op (the timer in the owning instance
+--- will commit when it fires).
+function M.commit_pending_switch()
+	local exec = grace_pending_execute
+	if not exec then
+		return false
+	end
+	if grace_timer then
+		pcall(vim.fn.timer_stop, grace_timer)
+		grace_timer = nil
+	end
+	grace_pending_execute = nil
+	pcall(clear_grace_state)
+	exec()
+	return true
+end
+
+function M.cancel_pending_switch()
+	local state = read_grace_state()
+	local target = (state and state.project) or grace_pending_project
+	if not target then
+		return false
+	end
+	cancel_grace_timer()
+	pcall(clear_grace_state)
+	cancel_suppressed_project = target
+	return true
 end
 
 function M.on_project_change(opts)
@@ -854,14 +1097,18 @@ function M.on_focus_gained()
 
 		ipc.register(project_name)
 
-		if project_name == last_project_name and tracker.storage.active_entry then
-			M.on_activity()
-			return
-		end
-
+		-- We just got focus — this is a fresh re-entry.  Re-run handle_project
+		-- so the pending grace state reflects "this nvim is now active".
+		cancel_grace_timer()
 		last_project_name = nil
-		handle_project(project_name)
+		handle_project(project_name, { fresh = true })
 	end)
+end
+
+function M.on_focus_lost()
+	-- No-op for now.  The previous debounce/threshold logic caused brief
+	-- focus blips to swallow project switches; on FocusGained we always
+	-- re-enter handle_project so the shared pending is authoritative.
 end
 
 ---@param bufnr integer
@@ -1069,7 +1316,7 @@ function M.init()
 		group = augroup,
 		once = true,
 		callback = function()
-			M.on_project_change({ startup = true })
+			M.on_project_change({ startup = true, fresh = true })
 		end,
 	})
 
@@ -1077,7 +1324,9 @@ function M.init()
 		group = augroup,
 		once = true,
 		callback = function()
+			local pending_t = grace_pending_timestamp
 			cancel_grace_timer()
+
 			local cfg = config.get()
 			local at_cfg = cfg.autotrack or {}
 			if not at_cfg.stop_on_exit then
@@ -1086,21 +1335,11 @@ function M.init()
 			if not tracker.storage.active_entry then
 				return
 			end
-			local current_project = M.detect_project()
-			if current_project ~= last_project_name then
-				logger.info(
-					"solidtime autotrack: exit — current project '"
-						.. (current_project or "?")
-						.. "' is not the tracked project '"
-						.. (last_project_name or "?")
-						.. "', leaving timer running"
-				)
-				return
-			end
-			if current_project and ipc.has_peer_for_project(current_project) then
+			local tracked_project = last_project_name or M.detect_project()
+			if tracked_project and ipc.has_peer_for_project(tracked_project) then
 				logger.info(
 					"solidtime autotrack: exit — another nvim is open for '"
-						.. current_project
+						.. tracked_project
 						.. "', leaving timer running"
 				)
 				return
@@ -1111,7 +1350,7 @@ function M.init()
 			if resume_window > 0 and tracker.storage.active_entry then
 				local active = tracker.storage.active_entry
 				save_exit_state({
-					project_name = current_project,
+					project_name = tracked_project,
 					entry_id = active.id,
 					start_time = active.start,
 					start_timestamp = active.start_timestamp,
@@ -1125,14 +1364,14 @@ function M.init()
 					tags = active.tags,
 				})
 			end
-			tracker.stop({ pause_autotrack = false })
+			tracker.stop({ pause_autotrack = false, end_timestamp = pending_t })
 		end,
 	})
 
 	vim.api.nvim_create_autocmd("DirChanged", {
 		group = augroup,
 		callback = function()
-			M.on_project_change()
+			M.on_project_change({ fresh = true })
 		end,
 	})
 
@@ -1147,6 +1386,13 @@ function M.init()
 		group = augroup,
 		callback = function()
 			M.on_focus_gained()
+		end,
+	})
+
+	vim.api.nvim_create_autocmd("FocusLost", {
+		group = augroup,
+		callback = function()
+			M.on_focus_lost()
 		end,
 	})
 

@@ -150,6 +150,29 @@ local function format_iso8601(timestamp)
 	return date
 end
 
+--- Parse an ISO8601 UTC string ("2026-04-17T08:13:35Z") into a unix timestamp.
+---@param s string|nil
+---@return integer|nil
+local function parse_iso8601(s)
+	if type(s) ~= "string" then
+		return nil
+	end
+	local y, mo, d, h, mi, sec = s:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then
+		return nil
+	end
+	local now = os.time()
+	local tz_offset = os.difftime(now, os.time(os.date("!*t", now)))
+	return os.time({
+		year = tonumber(y),
+		month = tonumber(mo),
+		day = tonumber(d),
+		hour = tonumber(h),
+		min = tonumber(mi),
+		sec = tonumber(sec),
+	}) + tz_offset
+end
+
 function M.init()
 	storage_dir = config.get().storage_dir
 
@@ -462,7 +485,7 @@ function M.stop(opts)
 	-- By default a manual stop pauses auto-tracking until the user starts again.
 	-- Internal callers (idle-stop) pass { pause_autotrack = false } to skip this.
 	local pause_autotrack = opts.pause_autotrack ~= false
-	local now = os.time()
+	local now = opts.end_timestamp or os.time()
 	if M.storage.active_entry == nil then
 		local result = api.getUserTimeEntry()
 
@@ -490,6 +513,19 @@ function M.stop(opts)
 		local remote = api.getUserTimeEntry()
 		if remote and remote.data and remote.data.id == M.storage.active_entry.id then
 			M.storage.active_entry.start = remote.data.start
+		end
+		local start_ts = parse_iso8601(M.storage.active_entry.start)
+		if start_ts and now < start_ts then
+			logger.warn(
+				string.format(
+					"solidtime tracker: requested stop end (%d) is before entry start (%d); falling back to now",
+					now,
+					start_ts
+				)
+			)
+			now = os.time()
+			M.storage.active_entry["end"] = format_iso8601(now)
+			M.storage.active_entry.end_timestamp = now
 		end
 		local result = api.updateTimeEntry(M.storage.active_entry.organization_id, M.storage.active_entry.id, {
 			member_id = M.storage.active_entry.member_id,

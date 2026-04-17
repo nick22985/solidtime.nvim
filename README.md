@@ -53,11 +53,11 @@ The shell has seven tabs shown at the top of the floating window:
 
 #### Switching tabs
 
-| Key                      | Action                                           |
-| ------------------------ | ------------------------------------------------ |
-| `<Tab>`                  | Cycle to the next tab                            |
-| `<S-Tab>`                | Cycle to the previous tab                        |
-| `<leader>1`–`<leader>7`  | Jump directly to tab 1–7 (Timer → Tickets)       |
+| Key                     | Action                                     |
+| ----------------------- | ------------------------------------------ |
+| `<Tab>`                 | Cycle to the next tab                      |
+| `<S-Tab>`               | Cycle to the previous tab                  |
+| `<leader>1`–`<leader>7` | Jump directly to tab 1–7 (Timer → Tickets) |
 
 > **Note:** bare number keys (`1`–`6`) are intentionally **not** bound inside the shell so
 > they remain available for Vim count motions (e.g. `5j`, `3k`).
@@ -93,10 +93,10 @@ The Tickets tab lets you search for tickets from external issue trackers and act
 
 #### Supported providers
 
-| Provider    | What is searched              |
-| ----------- | ----------------------------- |
-| Freedcamp   | Issues across your projects   |
-| Planka      | Cards across boards/projects  |
+| Provider  | What is searched             |
+| --------- | ---------------------------- |
+| Freedcamp | Issues across your projects  |
+| Planka    | Cards across boards/projects |
 
 #### Setup
 
@@ -128,18 +128,18 @@ The first time you open the Tickets tab for a project, press `p` to pick and lin
 
 #### Keymaps (Tickets tab)
 
-| Key          | Action                                                      |
-| ------------ | ----------------------------------------------------------- |
-| `/`          | Enter search mode — type a query, press `<Esc>` to run it  |
-| `<CR>`       | Load all tickets (when no results yet), or open action menu |
-| `o`          | Open the selected ticket in the browser                     |
-| `j` / `k`    | Move between ticket results                                 |
-| `gg` / `G`   | Jump to first / last ticket                                 |
-| `<C-d>` / `<C-u>` | Scroll half-page down / up                           |
-| `p`          | Pick / change linked project or board                       |
-| `<leader>g`  | Toggle global search (search all projects, not just linked) |
-| `<Esc>`      | Clear search query; second press exits global mode          |
-| `q`          | Close the shell                                             |
+| Key               | Action                                                      |
+| ----------------- | ----------------------------------------------------------- |
+| `/`               | Enter search mode — type a query, press `<Esc>` to run it   |
+| `<CR>`            | Load all tickets (when no results yet), or open action menu |
+| `o`               | Open the selected ticket in the browser                     |
+| `j` / `k`         | Move between ticket results                                 |
+| `gg` / `G`        | Jump to first / last ticket                                 |
+| `<C-d>` / `<C-u>` | Scroll half-page down / up                                  |
+| `p`               | Pick / change linked project or board                       |
+| `<leader>g`       | Toggle global search (search all projects, not just linked) |
+| `<Esc>`           | Clear search query; second press exits global mode          |
+| `q`               | Close the shell                                             |
 
 #### Action menu (`<CR>` on a ticket)
 
@@ -295,4 +295,3 @@ When a timer is running, activity events (`CursorMoved`, `InsertEnter`, `BufWrit
 ## API Reference
 
 - [Solidtime API docs](https://docs.solidtime.io/api-reference)
-

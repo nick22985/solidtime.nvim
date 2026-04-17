@@ -52,10 +52,16 @@ M.defaults = {
 			infer_client = false,
 		},
 
-		-- Grace period in seconds before auto-start triggers on project switch.
-		-- If you leave the project before this period, the timer won't start.
-		-- Set to 0 to start immediately (default).  Ignored on startup.
-		grace_period = 0,
+		-- Grace period in seconds before an auto-switch commits. While the
+		-- grace is pending, the previous project's timer keeps running. When
+		-- the grace elapses, the previous entry is stopped with end=T and the
+		-- new entry starts with start=T (where T is the moment the switch was
+		-- first detected). If you return to the previous project before the
+		-- grace elapses, the switch is cancelled and nothing changes.
+		-- You can commit or cancel a pending switch from the :SolidTime open
+		-- screen (the Timer tab shows a pending-switch banner with keybinds).
+		-- Set to 0 to switch immediately (no grace).  Ignored on startup.
+		grace_period = 300,
 
 		-- When true, switching to an auto-start project while a timer is
 		-- already running prompts for confirmation instead of switching
@@ -68,7 +74,7 @@ M.defaults = {
 		-- Set to 0 to disable.
 		resume_restart_window = 0,
 
-		ignore_buftypes = { "nofile", "terminal", "help", "quickfix", "prompt" },
+		ignore_buftypes = { "nofile", "terminal", "help", "quickfix", "prompt", "acwrite" },
 
 		ignore_buf_patterns = {
 			"^neo%-tree ",
@@ -78,6 +84,7 @@ M.defaults = {
 			"^diffview://",
 			"^Telescope",
 			"^toggleterm://",
+			"^solidtime://",
 		},
 	},
 

@@ -203,11 +203,12 @@ end
 
 function M._remote_stop()
 	local ok, tracker = pcall(require, "solidtime.tracker")
-	if not ok then
-		return
-	end
-	if tracker.storage and tracker.storage.active_entry then
+	if ok and tracker.storage and tracker.storage.active_entry then
 		tracker.clear_active_entry()
+	end
+	local ok_at, autotrack = pcall(require, "solidtime.autotrack")
+	if ok_at and autotrack.reset_local_state then
+		autotrack.reset_local_state()
 	end
 end
 
