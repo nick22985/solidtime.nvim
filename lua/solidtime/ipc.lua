@@ -212,6 +212,76 @@ function M._remote_stop()
 	end
 end
 
+function M.broadcast_grace(json_state)
+	local peers = live_peers()
+	if #peers == 0 then
+		return
+	end
+
+	local uv = vim.uv or vim.loop
+	local lua_code = "require('solidtime.ipc')._remote_grace(select(1, ...))"
+	local payload = vim.mpack.encode({ 2, "nvim_exec_lua", { lua_code, { json_state } } })
+
+	for _, socket_path in ipairs(peers) do
+		local pipe = uv.new_pipe(true)
+		if pipe then
+			pipe:connect(socket_path, function(err)
+				if err then
+					pipe:close()
+					return
+				end
+				pipe:write(payload, function()
+					pipe:close()
+				end)
+			end)
+		end
+	end
+end
+
+function M.broadcast_grace_clear()
+	local peers = live_peers()
+	if #peers == 0 then
+		return
+	end
+
+	local uv = vim.uv or vim.loop
+	local lua_code = "require('solidtime.ipc')._remote_grace_clear()"
+	local payload = vim.mpack.encode({ 2, "nvim_exec_lua", { lua_code, {} } })
+
+	for _, socket_path in ipairs(peers) do
+		local pipe = uv.new_pipe(true)
+		if pipe then
+			pipe:connect(socket_path, function(err)
+				if err then
+					pipe:close()
+					return
+				end
+				pipe:write(payload, function()
+					pipe:close()
+				end)
+			end)
+		end
+	end
+end
+
+function M._remote_grace(json)
+	local ok, state = pcall(vim.fn.json_decode, json)
+	if not ok or type(state) ~= "table" then
+		return
+	end
+	local ok_at, autotrack = pcall(require, "solidtime.autotrack")
+	if ok_at and autotrack._on_remote_grace then
+		autotrack._on_remote_grace(state)
+	end
+end
+
+function M._remote_grace_clear()
+	local ok_at, autotrack = pcall(require, "solidtime.autotrack")
+	if ok_at and autotrack._on_remote_grace_clear then
+		autotrack._on_remote_grace_clear()
+	end
+end
+
 ---@param storage_dir string  same dir solidtime uses for its storage JSON
 function M.init(storage_dir)
 	registry_file = storage_dir .. "/nvim_instances.json"
